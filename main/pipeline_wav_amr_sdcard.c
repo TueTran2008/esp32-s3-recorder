@@ -1,13 +1,3 @@
-/* Record wav and amr to SD card
- * g
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
 #include "audio_error.h"
 #include "audio_hal.h"
 #include "audio_mem.h"
@@ -154,7 +144,6 @@ static void pwm_update_output(uint32_t duty) {
 static void gpio_init(void) {
     gpio_config_t io_conf = {};
 
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
     // bit mask of the pins, use GPIO4/5 here
     io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
     // set as input mode
@@ -316,9 +305,9 @@ void app_main() {
     // audio_element_set_uri(des_fatfs_stream_writer, "/sdcard/rec_des.wav");
     // ESP_LOGI(TAG, "[4.5] Link it together raw_stream-->wav_encoder-->des encrypt-->fatfs_stream-->[sdcard]");
     /////////////////////////////////////////////////////////////////////
-    audio_pipeline_run(pipeline_wav);
-    // audio_pipeline_run(pipeline_des);
-    m_board_is_recording = true;
+    // audio_pipeline_run(pipeline_wav);
+    // // audio_pipeline_run(pipeline_des);
+    // m_board_is_recording = true;
 
     while (1) {
         if (xQueueReceive(gpio_evt_queue, &event, portTICK_RATE_MS * 0)) {
@@ -344,9 +333,10 @@ void app_main() {
                     // audio_pipeline_terminate(pipeline_des);
                     // audio_pipeline_reset_ringbuffer(pipeline_des);
                     // audio_pipeline_reset_elements(pipeline_des);
-                    ESP_LOGI(TAG, "[8.0] Stop audio_pipeline");
+
                     // encrypt file
-                    encrypt_wav("/sdcard/rec_out.wav", "/sdcard/des.wav");
+                    encrypt_wav("/sdcard/rec_out.wav", "/sdcard/rec_des.wav");
+                    ESP_LOGI(TAG, "[8.0] Stop audio_pipeline");
                     vTaskDelay(portTICK_RATE_MS * 5000); // wait 5 second before next record
                 } else {
                     ESP_LOGW(TAG, "[8.0] Stop audio pipeline but pipeline is empty");
@@ -361,7 +351,7 @@ void app_main() {
                 board_event_t event = BOARD_EVENT_STOP_RECORD;
                 xQueueSend(gpio_evt_queue, &event, 0);
             } else {
-                ESP_LOGI(TAG, "Record for %d milliseconds", (unsigned int)record_time);
+                ESP_LOGI(TAG, "Record for %u milliseconds", (unsigned int)record_time * 100);
             }
         }
         // read gpio event
