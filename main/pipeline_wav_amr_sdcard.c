@@ -7,8 +7,7 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
-#include "amrnb_encoder.h"
-#include "amrwb_encoder.h"
+
 #include "audio_error.h"
 #include "audio_hal.h"
 #include "audio_mem.h"
@@ -19,7 +18,7 @@
 #include "des_encoder.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "esp_event.h"
+
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "fatfs_stream.h"
@@ -29,7 +28,9 @@
 #include "raw_stream.h"
 #include "wav_encoder.h"
 #include <inttypes.h>
+#include <mbedtls/des.h>
 #include <stdbool.h>
+#include <string.h>
 
 typedef enum { BOARD_EVENT_RECORD = 0, BOARD_EVENT_STOP_RECORD = 1 } board_event_t;
 #define CONFIG_GPIO_SOUND_TRIG (17)
@@ -44,27 +45,75 @@ static bool board_init = false;
 static audio_board_handle_t m_board_handler = 0;
 static bool pwm_init = false;
 static QueueHandle_t gpio_evt_queue = NULL;
-static esp_timer_handle_t periodic_timer;
+
 // Dummy key (must be 8 bytes for DES)
 const unsigned char dummy_key[8] = "hihehahu";
 
-
-static void periodic_timer_callback(void *arg) {
-    static uint32_t timer_signal_off_count = 0;
-    uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
-    if (sound_trig_level == 0) {
-        timer_signal_off_count++;
-        if (timer_signal_off_count > TIMER_WAIT_THRESHOLD) {
-            board_event_t event = BOARD_EVENT_STOP_RECORD;
-            xQueueSendFromISR(gpio_evt_queue, &event, NULL);
-            /* Clean up and finish the example */
-            timer_signal_off_count = 0;
-            ESP_ERROR_CHECK(esp_timer_stop(periodic_timer));
-        }
-    } else {
-        timer_signal_off_count = 0; // reset
+// Encrypt WAV file
+void encrypt_wav(const char *input_path, const char *output_path) {
+    FILE *input = fopen(input_path, "rb");
+    FILE *output = fopen(output_path, "wb");
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Failed to open files.");
+        return;
     }
-    ESP_LOGI(TAG, "Periodic timer interrupt handler");
+
+    unsigned char header[HEADER_SIZE];
+    fread(header, 1, HEADER_SIZE, input);   // Read WAV header
+    fwrite(header, 1, HEADER_SIZE, output); // Write WAV header to output
+
+    unsigned char input_block[BLOCK_SIZE];
+    unsigned char output_block[BLOCK_SIZE];
+    size_t read_size;
+
+    mbedtls_des_context ctx;
+    mbedtls_des_init(&ctx);
+    mbedtls_des_setkey_enc(&ctx, dummy_key);
+
+    while ((read_size = fread(input_block, 1, BLOCK_SIZE, input)) > 0) {
+        if (read_size < BLOCK_SIZE) { // Padding if not a full block
+            memset(input_block + read_size, BLOCK_SIZE - read_size, BLOCK_SIZE - read_size);
+        }
+        mbedtls_des_crypt_ecb(&ctx, input_block, output_block); // Encrypt
+        fwrite(output_block, 1, BLOCK_SIZE, output);
+    }
+
+    fclose(input);
+    fclose(output);
+    mbedtls_des_free(&ctx);
+    ESP_LOGI(TAG, "Encryption complete. Saved to %s", output_path);
+}
+
+// Decrypt WAV file
+void decrypt_wav(const char *input_path, const char *output_path) {
+    FILE *input = fopen(input_path, "rb");
+    FILE *output = fopen(output_path, "wb");
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Failed to open files.");
+        return;
+    }
+
+    unsigned char header[HEADER_SIZE];
+    fread(header, 1, HEADER_SIZE, input);   // Read WAV header
+    fwrite(header, 1, HEADER_SIZE, output); // Write WAV header to output
+
+    unsigned char input_block[BLOCK_SIZE];
+    unsigned char output_block[BLOCK_SIZE];
+    size_t read_size;
+
+    mbedtls_des_context ctx;
+    mbedtls_des_init(&ctx);
+    mbedtls_des_setkey_dec(&ctx, dummy_key);
+
+    while ((read_size = fread(input_block, 1, BLOCK_SIZE, input)) > 0) {
+        mbedtls_des_crypt_ecb(&ctx, input_block, output_block); // Decrypt
+        fwrite(output_block, 1, BLOCK_SIZE, output);
+    }
+
+    fclose(input);
+    fclose(output);
+    mbedtls_des_free(&ctx);
+    ESP_LOGI(TAG, "Decryption complete. Saved to %s", output_path);
 }
 static void pwm_pin_init(void) {
     // Prepare and then apply the LEDC PWM timer configuration
@@ -102,26 +151,6 @@ static void pwm_update_output(uint32_t duty) {
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
 }
 
-static void IRAM_ATTR gpio_isr_handler(void *arg) {
-    // uint32_t gpio_num = (uint32_t *)arg;
-    //   xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL)
-    uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
-    ESP_LOGI(TAG, "Sound trigger level");
-    static bool m_task_count_no_signal = false;
-    if (sound_trig_level == 0) {
-        // sound trigger ok -> Start recording
-        // board_event_t event = BOARD_EVENT_RECORD;
-        // xQueueSendFromISR(gpio_evt_queue, &event, NULL);
-
-    } else {
-        // Low level means no signal -> Wait for couple of seconds
-        if (m_task_count_no_signal == false) {
-            m_task_count_no_signal = true;
-
-            ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 500000));
-        }
-    }
-}
 static void gpio_init(void) {
     gpio_config_t io_conf = {};
 
@@ -134,13 +163,6 @@ static void gpio_init(void) {
     io_conf.pull_up_en = 0;
     gpio_config(&io_conf);
 
-    // change gpio interrupt type for one pin
-    gpio_set_intr_type(CONFIG_GPIO_SOUND_TRIG, GPIO_INTR_ANYEDGE);
-
-    // install gpio isr service
-    gpio_install_isr_service(0);
-    // hook isr handler for specific gpio pin
-    gpio_isr_handler_add(CONFIG_GPIO_SOUND_TRIG, gpio_isr_handler, NULL);
     ESP_LOGI(TAG, "Custom board Sound Trigger has been initialized");
 }
 
@@ -169,20 +191,17 @@ void app_main() {
 
     board_event_t event;
     int sample_rate = 0;
-    audio_pipeline_handle_t pipeline_wav, pipeline_des;
-    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder, des_fatfs_stream_writer, des_encrypter;
+    audio_pipeline_handle_t pipeline_wav;
+    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder /*des_fatfs_stream_writer, des_encrypter*/;
     uint32_t record_time = 0;
     int volume = 0;
-
-    const esp_timer_create_args_t periodic_timer_args = {.callback = &periodic_timer_callback,
-                                                         /* name is optional, but may help identify the timer when debugging */
-                                                         .name = "periodic"};
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+    uint32_t timer_signal_off_count = 0;
+
     log_init();
     gpio_init();
     pwm_pin_init();
-    pwm_update_output(13);
-    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+    pwm_update_output(14);
 
     ESP_LOGI(TAG, "[1.0] Mount sdcard");
     // Initialize peripherals management
@@ -254,51 +273,51 @@ void app_main() {
     ESP_LOGI(TAG, "Get board volume :%d", volume);
 
     ////////////////////////////////////////////////////////////
-    ESP_LOGI(TAG, "[4.0] Create audio pipeline_des for recording");
-    audio_pipeline_cfg_t pipeline_cfg_dup = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipeline_des = audio_pipeline_init(&pipeline_cfg_dup);
-    mem_assert(pipeline_des);
-
-    ESP_LOGI(TAG, "[4.1] Create des encrypt to encrypt wav format");
-
-    ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
-    wav_encoder_cfg_t wav_cfg_copy = DEFAULT_WAV_ENCODER_CONFIG();
-    audio_element_handle_t wav_encoder_copy = wav_encoder_init(&wav_cfg_copy);
-
-    ESP_LOGI(TAG, "[4.1] Create raw stream to write data");
-    raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
-    raw_cfg.type = AUDIO_STREAM_READER;
-    audio_element_handle_t el_raw_reader = raw_stream_init(&raw_cfg);
-
-    des_encrypt_cfg_t des_cfg = DEFAULT_DES_ENCODER_CONFIG();
-    des_cfg.block_size = BLOCK_SIZE;
-    des_cfg.header_size = HEADER_SIZE;
-    des_cfg.key = dummy_key;
-    des_encrypter = des_encoder_init(&des_cfg);
-
-    ESP_LOGI(TAG, "[4.2] Create fatfs stream to write des data to sdcard");
-    fatfs_stream_cfg_t des_fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
-    des_fatfs_cfg.type = AUDIO_STREAM_WRITER;
-    des_fatfs_cfg.task_core = 1;
-    des_fatfs_stream_writer = fatfs_stream_init(&des_fatfs_cfg);
-
-    audio_pipeline_register(pipeline_des, el_raw_reader, "des_raw");
-    audio_pipeline_register(pipeline_des, des_encrypter, "des_encrypt");
-    audio_pipeline_register(pipeline_des, des_fatfs_stream_writer, "des_file");
-    audio_pipeline_register(pipeline_des, wav_encoder_copy, "wav_copy");
-
-    const char *link_amr[4] = {"des_raw", "des_encrypt", "wav_copy", "des_file"};
-    audio_pipeline_link(pipeline_des, &link_amr[0], 4);
-    ESP_LOGI(TAG, "[4.3] Create ringbuf to link  i2s");
-    ringbuf_handle_t rb = audio_element_get_output_ringbuf(el_raw_reader);
-    audio_element_set_multi_output_ringbuf(i2s_stream_reader, rb, 0);
-
-    ESP_LOGI(TAG, "[4.4] Set up  uri (file as fatfs_stream, wav as wav encoder)");
-    audio_element_set_uri(des_fatfs_stream_writer, "/sdcard/rec_des.wav");
-    ESP_LOGI(TAG, "[4.5] Link it together raw_stream-->amr_encoder-->fatfs_stream-->[sdcard]");
-
+    // ESP_LOGI(TAG, "[4.0] Create audio pipeline_des for recording");
+    // audio_pipeline_cfg_t pipeline_cfg_dup = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    // pipeline_des = audio_pipeline_init(&pipeline_cfg_dup);
+    // mem_assert(pipeline_des);
+    //
+    // ESP_LOGI(TAG, "[4.1] Create des encrypt to encrypt wav format");
+    //
+    // ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
+    // wav_encoder_cfg_t wav_cfg_copy = DEFAULT_WAV_ENCODER_CONFIG();
+    // audio_element_handle_t wav_encoder_copy = wav_encoder_init(&wav_cfg_copy);
+    //
+    // ESP_LOGI(TAG, "[4.1] Create raw stream to write data");
+    // raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
+    // raw_cfg.type = AUDIO_STREAM_READER;
+    // audio_element_handle_t el_raw_reader = raw_stream_init(&raw_cfg);
+    //
+    // des_encrypt_cfg_t des_cfg = DEFAULT_DES_ENCODER_CONFIG();
+    // des_cfg.block_size = BLOCK_SIZE;
+    // des_cfg.header_size = HEADER_SIZE;
+    // des_cfg.key = (uint8_t *)dummy_key;
+    // des_encrypter = des_encoder_init(&des_cfg);
+    //
+    // ESP_LOGI(TAG, "[4.2] Create fatfs stream to write des data to sdcard");
+    // fatfs_stream_cfg_t des_fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
+    // des_fatfs_cfg.type = AUDIO_STREAM_WRITER;
+    // des_fatfs_cfg.task_core = 1;
+    // des_fatfs_stream_writer = fatfs_stream_init(&des_fatfs_cfg);
+    //
+    // audio_pipeline_register(pipeline_des, el_raw_reader, "des_raw");
+    // audio_pipeline_register(pipeline_des, des_encrypter, "des_encrypt");
+    // audio_pipeline_register(pipeline_des, des_fatfs_stream_writer, "des_file");
+    // audio_pipeline_register(pipeline_des, wav_encoder_copy, "wav_copy");
+    //
+    // const char *link_amr[4] = {"des_raw", "des_encrypt", "wav_copy", "des_file"};
+    // audio_pipeline_link(pipeline_des, &link_amr[0], 4);
+    // ESP_LOGI(TAG, "[4.3] Create ringbuf to link  i2s");
+    // ringbuf_handle_t rb = audio_element_get_output_ringbuf(el_raw_reader);
+    // audio_element_set_multi_output_ringbuf(i2s_stream_reader, rb, 0);
+    //
+    // ESP_LOGI(TAG, "[4.4] Set up  uri (file as fatfs_stream, wav as wav encoder)");
+    // audio_element_set_uri(des_fatfs_stream_writer, "/sdcard/rec_des.wav");
+    // ESP_LOGI(TAG, "[4.5] Link it together raw_stream-->wav_encoder-->des encrypt-->fatfs_stream-->[sdcard]");
+    /////////////////////////////////////////////////////////////////////
     audio_pipeline_run(pipeline_wav);
-    audio_pipeline_run(pipeline_des);
+    // audio_pipeline_run(pipeline_des);
     m_board_is_recording = true;
 
     while (1) {
@@ -310,7 +329,7 @@ void app_main() {
 
                 ESP_LOGI(TAG, "[6.0] start audio_pipeline");
                 audio_pipeline_run(pipeline_wav);
-                audio_pipeline_run(pipeline_des);
+                // audio_pipeline_run(pipeline_des);
 
             } else if (event == BOARD_EVENT_STOP_RECORD && m_board_is_recording == true) {
                 if (pipeline_wav) {
@@ -320,12 +339,15 @@ void app_main() {
                     audio_pipeline_reset_ringbuffer(pipeline_wav);
                     audio_pipeline_reset_elements(pipeline_wav);
                     //////
-                    audio_pipeline_stop(pipeline_des);
-                    audio_pipeline_wait_for_stop(pipeline_des);
-                    audio_pipeline_terminate(pipeline_des);
-                    audio_pipeline_reset_ringbuffer(pipeline_des);
-                    audio_pipeline_reset_elements(pipeline_des);
+                    // audio_pipeline_stop(pipeline_des);
+                    // audio_pipeline_wait_for_stop(pipeline_des);
+                    // audio_pipeline_terminate(pipeline_des);
+                    // audio_pipeline_reset_ringbuffer(pipeline_des);
+                    // audio_pipeline_reset_elements(pipeline_des);
                     ESP_LOGI(TAG, "[8.0] Stop audio_pipeline");
+                    // encrypt file
+                    encrypt_wav("/sdcard/rec_out.wav", "/sdcard/des.wav");
+                    vTaskDelay(portTICK_RATE_MS * 5000); // wait 5 second before next record
                 } else {
                     ESP_LOGW(TAG, "[8.0] Stop audio pipeline but pipeline is empty");
                 }
@@ -336,13 +358,36 @@ void app_main() {
             record_time++;
             if (record_time >= (RECORD_TIME_SECONDS)) {
                 ESP_LOGW(TAG, "Record more than 30 seconds -> stopping");
-                // m_board_is_recording = false;
                 board_event_t event = BOARD_EVENT_STOP_RECORD;
                 xQueueSend(gpio_evt_queue, &event, 0);
             } else {
                 ESP_LOGI(TAG, "Record for %d milliseconds", (unsigned int)record_time);
             }
         }
-        vTaskDelay(portTICK_RATE_MS * 1000);
+        // read gpio event
+        uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
+        if (sound_trig_level == 0) {
+            if (m_board_is_recording == false) {
+                ESP_LOGW(TAG, "Detect sound trigger value low -> send event start recording");
+                // m_board_is_recording = false;
+                board_event_t event = BOARD_EVENT_RECORD;
+                xQueueSend(gpio_evt_queue, &event, 0);
+            } else {
+                timer_signal_off_count = 0;
+            }
+        } else {
+            if (m_board_is_recording == true) {
+                timer_signal_off_count++;
+                if (timer_signal_off_count > SOUND_TRIGGER_OFF_WAIT) {
+                    ESP_LOGW(TAG, "Sound trigger off for 5 seconds -> stopping");
+                    // m_board_is_recording = false;
+                    board_event_t event = BOARD_EVENT_STOP_RECORD;
+                    xQueueSend(gpio_evt_queue, &event, 0);
+
+                } // wait 5s of of sound trigger off to kill
+            }
+        }
+        ESP_LOGI(TAG, "Sound trigger level: %u", (unsigned int)sound_trig_level);
+        vTaskDelay(portTICK_RATE_MS * 100);
     }
 }

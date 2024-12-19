@@ -63,12 +63,12 @@ static esp_err_t _des_encoder_destroy(audio_element_handle_t self) {
     return ESP_OK;
 }
 static esp_err_t _des_encoder_open(audio_element_handle_t self) {
-    ESP_LOGD(TAG, "_des_encoder_open");
+    ESP_LOGE(TAG, "_des_encoder_open");
     return ESP_OK;
 }
 
 static esp_err_t _des_encoder_close(audio_element_handle_t self) {
-    ESP_LOGD(TAG, "_des_encoder_close");
+    ESP_LOGE(TAG, "_des_encoder_close");
     if (AEL_STATE_PAUSED != audio_element_get_state(self)) {
         audio_element_set_byte_pos(self, 0);
         audio_element_set_total_bytes(self, 0);
@@ -78,16 +78,17 @@ static esp_err_t _des_encoder_close(audio_element_handle_t self) {
 
 static int _des_encoder_process(audio_element_handle_t self, char *in_buffer, int in_len) {
     int r_size = audio_element_input(self, in_buffer, in_len);
-    //uint8_t buffer[r_size * 2];
-    //size_t buffer_len = 0;
-    //memset(buffer, 0, sizeof(buffer));
-    //encrypt_wav_buffer(self, (uint8_t *)in_buffer, r_size, (uint8_t *)buffer, &buffer_len);
+    des_encrypt_t *des = (des_encrypt_t *)audio_element_getdata(self);
+    // uint8_t buffer[r_size * 2];
+    size_t buffer_len = 0;
+    /* memset(des->buffer, 0, 2 * DES_BUFFER_SIZE); */
+    encrypt_wav_buffer(self, (uint8_t *)in_buffer, r_size, (uint8_t *)des->buffer, &buffer_len);
     int out_len = r_size;
     if (r_size > 0) {
-        out_len = audio_element_output(self, (char*)in_buffer, r_size);
-        // if (out_len > 0) {
-        //     audio_element_update_byte_pos(self, out_len);
-        // }
+        out_len = audio_element_output(self, (char *)des->buffer, buffer_len);
+        if (out_len > 0) {
+            audio_element_update_byte_pos(self, out_len);
+        }
     }
 
     return out_len;
@@ -115,6 +116,20 @@ audio_element_handle_t des_encoder_init(des_encrypt_cfg_t *config) {
     cfg.tag = "des";
     des->block_size = config->block_size;
     des->header_size = config->header_size;
+
+    bool _success = true;
+    des->buffer = (uint8_t *)audio_calloc(1, 2 * DES_BUFFER_SIZE);
+    if (des->buffer == NULL) {
+        _success = false;
+    }
+    //_success = ((des->buffer = (uint8_t*)audio_calloc(1, 2 * DES_BUFFER_SIZE) != NULL);
+
+    AUDIO_NULL_CHECK(TAG, _success, {
+        ESP_LOGE(TAG, "Error occured");
+        // _des_encoder_destroy(el);
+        audio_free(des);
+        return NULL;
+    });
     memcpy(des->key, config->key, sizeof(des->key));
     mbedtls_des_init(&des->ctx);
     mbedtls_des_setkey_enc(&des->ctx, des->key);
