@@ -1,0 +1,369 @@
+/* Record wav and amr to SD card
+ * g
+
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
+
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
+#include "amrnb_encoder.h"
+#include "amrwb_encoder.h"
+#include "audio_error.h"
+#include "audio_hal.h"
+#include "audio_mem.h"
+#include "audio_pipeline.h"
+#include "board.h"
+#include "board_recorder.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "fatfs_stream.h"
+#include "i2s_stream.h"
+#include "raw_stream.h"
+#include "wav_encoder.h"
+#include <inttypes.h>
+#include <stdbool.h>
+
+#define CONFIG_GPIO_SOUND_TRIG (17)
+#define GPIO_INPUT_PIN_SEL ((1ULL << CONFIG_GPIO_SOUND_TRIG))
+#define TIMER_WAIT_THRESHOLD 10
+
+extern audio_hal_func_t AUDIO_CODEC_ES8388_DEFAULT_HANDLE;
+
+static bool m_board_is_recording = false;
+static const char *TAG = "PIPELINR_REC_WAV_AMR_SDCARD";
+static bool board_init = false;
+static audio_board_handle_t m_board_handler = 0;
+static bool pwm_init = false;
+static QueueHandle_t gpio_evt_queue = NULL;
+static esp_timer_handle_t periodic_timer;
+typedef enum { BOARD_IDLE = 0, BOARD_START_RECORD = 1, BOARD_STOP_RECORD = 2 } board_state_t;
+static void periodic_timer_callback(void *arg) {
+    // int64_t time_since_boot = esp_timer_get_time();
+    //  ESP_LOGI(TAG, "Periodic timer called, time since boot: %lld us", time_since_boot);
+    static uint32_t timer_signal_off_count = 0;
+    uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
+    if (sound_trig_level == 0) {
+        timer_signal_off_count++;
+        if (timer_signal_off_count > TIMER_WAIT_THRESHOLD) {
+            board_event_t event = BOARD_EVENT_STOP_RECORD;
+            xQueueSendFromISR(gpio_evt_queue, &event, NULL);
+            /* Clean up and finish the example */
+            timer_signal_off_count = 0;
+            ESP_ERROR_CHECK(esp_timer_stop(periodic_timer));
+        }
+    } else {
+        timer_signal_off_count = 0; // reset
+    }
+}
+static void pwm_pin_init(void) {
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {.speed_mode = LEDC_MODE,
+                                      .duty_resolution = LEDC_DUTY_RES,
+                                      .timer_num = LEDC_TIMER,
+                                      .freq_hz = LEDC_FREQUENCY, // Set output frequency at 4 kHz
+                                      .clk_cfg = LEDC_AUTO_CLK};
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {.speed_mode = LEDC_MODE,
+                                          .channel = LEDC_CHANNEL,
+                                          .timer_sel = LEDC_TIMER,
+                                          .intr_type = LEDC_INTR_DISABLE,
+                                          .gpio_num = LEDC_OUTPUT_IO,
+                                          .duty = 0, // Set duty to 0%
+                                          .hpoint = 0};
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    pwm_init = true;
+}
+
+static void pwm_update_output(uint32_t duty) {
+    if (pwm_init == false) {
+        pwm_pin_init();
+    }
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+}
+
+static void IRAM_ATTR gpio_isr_handler(void *arg) {
+    // uint32_t gpio_num = (uint32_t *)arg;
+    //   xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL)
+    uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
+    static bool m_task_count_no_signal = false;
+    if (sound_trig_level) {
+        // sound trigger ok -> Start recording
+        board_event_t event = BOARD_EVENT_RECORD;
+        xQueueSendFromISR(gpio_evt_queue, &event, NULL);
+    } else {
+        // Low level means no signal -> Wait for couple of seconds
+        if (m_task_count_no_signal == false) {
+            m_task_count_no_signal = true;
+
+            ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 500000));
+        }
+    }
+}
+static void gpio_init(void) {
+    gpio_config_t io_conf = {};
+
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    // bit mask of the pins, use GPIO4/5 here
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+    // set as input mode
+    io_conf.mode = GPIO_MODE_INPUT;
+    // enable pull-up mode
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+
+    // change gpio interrupt type for one pin
+    gpio_set_intr_type(CONFIG_GPIO_SOUND_TRIG, GPIO_INTR_ANYEDGE);
+
+    // install gpio isr service
+    gpio_install_isr_service(0);
+    // hook isr handler for specific gpio pin
+    gpio_isr_handler_add(CONFIG_GPIO_SOUND_TRIG, gpio_isr_handler, (void *)CONFIG_GPIO_SOUND_TRIG);
+}
+
+static audio_board_handle_t esp_custom_board_handle_init(void) {
+    if (board_init) {
+        ESP_LOGW(TAG, "Custom board has  been initialized!");
+        return m_board_handler;
+    }
+    audio_hal_codec_config_t audio_codec_cfg = AUDIO_CODEC_DEFAULT_CONFIG(); // config from board_def.h
+    m_board_handler = (audio_board_handle_t)audio_calloc(1, sizeof(struct audio_board_handle));
+
+    AUDIO_MEM_CHECK(TAG, m_board_handler, return NULL);
+    m_board_handler->audio_hal = audio_hal_init(&audio_codec_cfg, &AUDIO_CODEC_ES8388_DEFAULT_HANDLE);
+
+    AUDIO_MEM_CHECK(TAG, m_board_handler->audio_hal, return NULL);
+    board_init = true;
+    return m_board_handler;
+}
+
+static void log_init(void) {
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+}
+
+void app_main() {
+
+    board_event_t event;
+    int sample_rate = 0;
+    audio_pipeline_handle_t pipeline_wav;
+    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder;
+
+    const esp_timer_create_args_t periodic_timer_args = {.callback = &periodic_timer_callback,
+                                                         /* name is optional, but may help identify the timer when debugging */
+                                                         .name = "periodic"};
+    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+    log_init();
+    gpio_init();
+    pwm_pin_init();
+    pwm_update_output(50);
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+
+    ESP_LOGI(TAG, "[1.0] Mount sdcard");
+    // Initialize peripherals management
+
+    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+    // Initialize SD Card peripheral
+    audio_board_sdcard_init(set, SD_MODE_4_LINE);
+
+    // Init audio hal to communicate with codec
+    ESP_LOGI(TAG, "[2.0] Start codec chip");
+    audio_board_handle_t board_handle = esp_custom_board_handle_init();
+    audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+
+    gpio_evt_queue = xQueueCreate(10, sizeof(board_event_t));
+
+    ESP_LOGI(TAG, "[3.0] Create audio pipeline_wav for recording");
+    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    pipeline_wav = audio_pipeline_init(&pipeline_cfg);
+    mem_assert(pipeline_wav);
+
+    ESP_LOGI(TAG, "[3.1] Create i2s stream to read audio data from codec chip");
+    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
+    i2s_cfg.type = AUDIO_STREAM_READER;
+    i2s_cfg.multi_out_num = 1;
+    i2s_cfg.task_core = 1;
+    sample_rate = 16000;
+// #ifdef CONFIG_CHOICE_AMR_WB
+//         sample_rate = 16000;
+// #elif defined CONFIG_CHOICE_AMR_NB
+//         sample_rate = 8000;
+// #endif
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+    i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
+    i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
+    i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
+#else
+    i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
+    i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    i2s_cfg.i2s_config.sample_rate = sample_rate;
+#endif // (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+
+    i2s_stream_reader = i2s_stream_init(&i2s_cfg);
+
+    ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
+    wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
+    wav_encoder = wav_encoder_init(&wav_cfg);
+
+    ESP_LOGI(TAG, "[3.3] Create fatfs stream to write data to sdcard");
+    fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
+    fatfs_cfg.type = AUDIO_STREAM_WRITER;
+    wav_fatfs_stream_writer = fatfs_stream_init(&fatfs_cfg);
+
+    audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
+    audio_element_getinfo(i2s_stream_reader, &info);
+    audio_element_setinfo(wav_fatfs_stream_writer, &info);
+
+    ESP_LOGI(TAG, "[3.4] Register all elements to audio pipeline");
+    audio_pipeline_register(pipeline_wav, i2s_stream_reader, "i2s");
+    audio_pipeline_register(pipeline_wav, wav_encoder, "wav");
+    audio_pipeline_register(pipeline_wav, wav_fatfs_stream_writer, "wav_file");
+
+    ESP_LOGI(TAG, "[3.5] Link it together "
+                  "[codec_chip]-->i2s_stream-->wav_encoder-->fatfs_stream-->[sdcard]");
+    const char *link_wav[3] = {"i2s", "wav", "wav_file"};
+    audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
+
+    ESP_LOGI(TAG, "[3.6] Set up  uri (file as fatfs_stream, wav as wav encoder)");
+    audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 100000));
+
+    while (1) {
+        if (xQueueReceive(gpio_evt_queue, &event, portTICK_RATE_MS * 1000)) {
+            if (event == BOARD_EVENT_RECORD && m_board_is_recording == false) {
+                m_board_is_recording = true;
+
+                // ESP_LOGI(TAG, "[4.0] Create audio amr_pipeline for recording");
+                // pipeline_amr = audio_pipeline_init(&pipeline_cfg);
+
+                // ESP_LOGI(TAG, "[4.1] Create raw stream to write data");
+                // raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
+                /// raw_cfg.type = AUDIO_STREAM_READER;
+                // audio_element_handle_t el_raw_reader = raw_stream_init(&raw_cfg);
+
+                ESP_LOGI(TAG, "[4.2] Create amr encoder to encode wav format");
+                // #ifdef CONFIG_CHOICE_AMR_WB
+                //         amrwb_encoder_cfg_t amr_enc_cfg = DEFAULT_AMRWB_ENCODER_CONFIG();
+                //         amr_encoder = amrwb_encoder_init(&amr_enc_cfg);
+                // #elif defined CONFIG_CHOICE_AMR_NB
+                //         amrnb_encoder_cfg_t amr_enc_cfg = DEFAULT_AMRNB_ENCODER_CONFIG();
+                //         amr_encoder = amrnb_encoder_init(&amr_enc_cfg);
+                // #endif
+
+                // ESP_LOGI(TAG, "[4.3] Create fatfs stream to write data to sdcard");
+                // fatfs_stream_cfg_t amr_fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
+                // amr_fatfs_cfg.type = AUDIO_STREAM_WRITER;
+                // amr_fatfs_cfg.task_core = 1;
+                // amr_fatfs_stream_writer = fatfs_stream_init(&amr_fatfs_cfg);
+
+                // ESP_LOGI(TAG, "[4.4] Register all elements to audio amr_pipeline");
+                // audio_pipeline_register(pipeline_amr, el_raw_reader, "amr_raw");
+                // #ifdef CONFIG_CHOICE_AMR_WB
+                //         audio_pipeline_register(pipeline_amr, amr_encoder, "Wamr");
+                // #elif defined CONFIG_CHOICE_AMR_NB
+                //         audio_pipeline_register(pipeline_amr, amr_encoder, "amr");
+                // #endif
+                // audio_pipeline_register(pipeline_amr, amr_fatfs_stream_writer, "amr_file");
+
+                // ESP_LOGI(TAG, "[4.5] Link it together "
+                //               "raw_stream-->amr_encoder-->fatfs_stream-->[sdcard]");
+                // #ifdef CONFIG_CHOICE_AMR_WB
+                //         const char *link_amr[3] = {"amr_raw", "Wamr", "amr_file"};
+                //         audio_pipeline_link(pipeline_amr, &link_amr[0], 3);
+                // #elif defined CONFIG_CHOICE_AMR_NB
+                //         const char *link_amr[3] = {"amr_raw", "amr", "amr_file"};
+                //         audio_pipeline_link(pipeline_amr, &link_amr[0], 3);
+                // #endif
+
+                // ESP_LOGI(TAG, "[4.6] Create ringbuf to link  i2s");
+                // ringbuf_handle_t rb = audio_element_get_output_ringbuf(el_raw_reader);
+                // audio_element_set_multi_output_ringbuf(i2s_stream_reader, rb, 0);
+
+                ESP_LOGI(TAG, "[4.7] Set up  uri (file as fatfs_stream, wav as wav encoder)");
+                // #ifdef CONFIG_CHOICE_AMR_WB
+                //         audio_element_set_uri(amr_fatfs_stream_writer, "/sdcard/rec_out.Wamr");
+                // #elif defined CONFIG_CHOICE_AMR_NB
+                //         audio_element_set_uri(amr_fatfs_stream_writer, "/sdcard/rec_out.amr");
+                // #endif
+
+                // ESP_LOGI(TAG, "[5.0] Set up  event listener");
+                // audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
+                // audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
+                //
+                // audio_pipeline_set_listener(pipeline_wav, evt);
+                // // audio_pipeline_set_listener(pipeline_amr, evt);
+                //
+                // ESP_LOGI(TAG, "[5.1] Listening event from peripherals");
+                // audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
+
+                ESP_LOGI(TAG, "[6.0] start audio_pipeline");
+                audio_pipeline_run(pipeline_wav);
+                // audio_pipeline_run(pipeline_amr);
+
+                ESP_LOGI(TAG, "[7.0] Listen for all pipeline events, record for %d seconds", RECORD_TIME_SECONDS);
+                /* Start the timers */
+
+                // int second_recorded = 0;
+
+                //     audio_event_iface_msg_t msg;
+                //     if (audio_event_iface_listen(evt, &msg, 1000 / portTICK_RATE_MS) != ESP_OK) {
+                //         second_recorded++;
+                //         ESP_LOGI(TAG, "[ * ] Recording ... %d", second_recorded);
+                //         if (second_recorded >= RECORD_TIME_SECONDS) {
+                //             ESP_LOGI(TAG, "Finishing recording");
+                //             audio_element_set_ringbuf_done(i2s_stream_reader);
+                //         }
+                //         continue;
+                //     }
+                //
+                //     /* Stop when the last pipeline element (i2s_stream_reader in this case)
+                //      * receives stop event */
+                //     if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *)i2s_stream_reader && msg.cmd == AEL_MSG_CMD_REPORT_STATUS &&
+                //         (((int)msg.data == AEL_STATUS_STATE_STOPPED) || ((int)msg.data == AEL_STATUS_STATE_FINISHED))) {
+                //         ESP_LOGW(TAG, "[ * ] Stop event received");
+                //         break;
+                //     }
+                // }
+            } else if (event == BOARD_EVENT_STOP_RECORD && m_board_is_recording == true) {
+                if (pipeline_wav == NULL) {
+                    audio_pipeline_stop(pipeline_wav);
+                    audio_pipeline_wait_for_stop(pipeline_wav);
+                    ESP_LOGI(TAG, "[8.0] Stop audio_pipeline");
+                } else {
+                    ESP_LOGW(TAG, "[8.0] Stop audio pipeline but pipeline is empty");
+                }
+
+                // audio_pipeline_terminate(pipeline_wav);
+                // audio_pipeline_unregister_more(pipeline_wav, i2s_stream_reader, wav_encoder, wav_fatfs_stream_writer, NULL);
+                // audio_pipeline_unregister_more(pipeline_amr, el_raw_reader, amr_encoder, amr_fatfs_stream_writer, NULL);
+
+                /* Terminate the pipeline before removing the listener */
+                // audio_pipeline_remove_listener(pipeline_wav);
+                //
+                // /* Stop all periph before removing the listener */
+                // esp_periph_set_stop_all(set);
+                // audio_event_iface_remove_listener(esp_periph_set_get_event_iface(set), evt);
+
+                /* Make sure audio_pipeline_remove_listener &
+                 * audio_event_iface_remove_listener are called before destroying event_iface
+                 */
+                // audio_event_iface_destroy(evt);
+
+                /* Release all resources */
+                // audio_pipeline_deinit(pipeline_wav);
+                // audio_element_deinit(i2s_stream_reader);
+                // audio_element_deinit(wav_encoder);
+                // audio_element_deinit(wav_fatfs_stream_writer);
+                // esp_periph_set_destroy(set);
+                m_board_is_recording = false;
+            }
+        }
+    }
+}
