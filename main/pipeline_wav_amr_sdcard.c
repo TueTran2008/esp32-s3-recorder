@@ -35,9 +35,11 @@ static bool board_init = false;
 static audio_board_handle_t m_board_handler = 0;
 static bool pwm_init = false;
 static QueueHandle_t gpio_evt_queue = NULL;
+static uint32_t timer_signal_off_count = 0;
 
 // Dummy key (must be 8 bytes for DES)
 const unsigned char dummy_key[8] = "hihehahu";
+static bool count_signal_off = false;
 
 // Encrypt WAV file
 void encrypt_wav(const char *input_path, const char *output_path) {
@@ -127,9 +129,18 @@ static void pwm_pin_init(void) {
 }
 
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
-    if (m_board_is_recording == false) {
-        static board_event_t event = BOARD_EVENT_RECORD;
-        xQueueSendFromISR(gpio_evt_queue, &event, NULL);
+    uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
+    if (sound_trig_level == false) {
+        count_signal_off = false;
+        if (m_board_is_recording == false) {
+            static board_event_t event = BOARD_EVENT_RECORD;
+            xQueueSendFromISR(gpio_evt_queue, &event, NULL);
+        }
+    } else {
+        if (m_board_is_recording == true) {
+            count_signal_off = true;
+            timer_signal_off_count = 0;
+        }
     }
 }
 
@@ -158,12 +169,12 @@ static void gpio_init(void) {
     // enable pull-up mode
     io_conf.pull_up_en = 0;
 
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
 
     gpio_config(&io_conf);
 
     // change gpio interrupt type for one pin
-    gpio_set_intr_type(CONFIG_GPIO_SOUND_TRIG, GPIO_INTR_NEGEDGE);
+    gpio_set_intr_type(CONFIG_GPIO_SOUND_TRIG, GPIO_INTR_ANYEDGE);
 
     // install gpio isr service
     gpio_install_isr_service(0);
@@ -203,7 +214,6 @@ void app_main() {
     uint32_t record_time = 0;
     int volume = 0;
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-    uint32_t timer_signal_off_count = 0;
 
     log_init();
     gpio_init();
@@ -276,14 +286,14 @@ void app_main() {
     audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
 
     ESP_LOGI(TAG, "[3.6] Set up  uri (file as fatfs_stream, wav as wav encoder)");
-    audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
-
-    ESP_LOGI(TAG, "Get board volume :%d", volume);
-
     audio_element_info_t music_info = {0};
     audio_element_getinfo(i2s_stream_reader, &music_info);
     ESP_LOGI(TAG, "[ * ] Save the recording info to the fatfs stream writer, sample_rates=%d, bits=%d, ch=%d", music_info.sample_rates, music_info.bits, music_info.channels);
     audio_element_setinfo(wav_fatfs_stream_writer, &music_info);
+
+    audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
+
+    ESP_LOGI(TAG, "Get board volume :%d", volume);
 
     while (1) {
         if (xQueueReceive(gpio_evt_queue, &event, portTICK_RATE_MS * 0)) {
@@ -334,8 +344,8 @@ void app_main() {
             record_time = 0;
         }
         // read gpio event
-        uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
-        if (sound_trig_level == 1) {
+
+        if (count_signal_off == true) {
             if (m_board_is_recording == true) {
                 timer_signal_off_count++;
                 if (timer_signal_off_count > SOUND_TRIGGER_OFF_WAIT) {
@@ -346,6 +356,8 @@ void app_main() {
 
                 } // wait 5s of of sound trigger off to kill
             }
+        } else {
+            timer_signal_off_count = 0;
         }
         // ESP_LOGI(TAG, "Sound trigger level: %u", (unsigned int)sound_trig_level);
         vTaskDelay(portTICK_RATE_MS * 100);
