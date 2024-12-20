@@ -177,7 +177,7 @@ static void gpio_init(void) {
     gpio_set_intr_type(CONFIG_GPIO_SOUND_TRIG, GPIO_INTR_ANYEDGE);
 
     // install gpio isr service
-    gpio_install_isr_service(0);
+    // gpio_install_isr_service(0); // need because the SD card already did this
     // hook isr handler for specific gpio pin
     gpio_isr_handler_add(CONFIG_GPIO_SOUND_TRIG, gpio_isr_handler, NULL);
     ESP_LOGI(TAG, "Custom board Sound Trigger has been initialized");
@@ -210,13 +210,12 @@ void app_main() {
     int channel_format = I2S_CHANNEL_TYPE_RIGHT_LEFT;
     int sample_rate = 16000;
     audio_pipeline_handle_t pipeline_wav;
-    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder /*des_fatfs_stream_writer, des_encrypter*/;
+    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder;
     uint32_t record_time = 0;
     int volume = 0;
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
 
     log_init();
-    gpio_init();
     pwm_pin_init();
     pwm_update_output(10);
 
@@ -234,7 +233,6 @@ void app_main() {
 
     audio_hal_set_volume(board_handle->audio_hal, 80);
     audio_hal_get_volume(board_handle->audio_hal, &volume);
-    gpio_evt_queue = xQueueCreate(10, sizeof(board_event_t));
 
     ESP_LOGI(TAG, "[3.0] Create audio pipeline_wav for recording");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
@@ -294,9 +292,10 @@ void app_main() {
     audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
 
     ESP_LOGI(TAG, "Get board volume :%d", volume);
-
+    gpio_evt_queue = xQueueCreate(10, sizeof(board_event_t));
+    gpio_init(); // initialized sound trigger
     while (1) {
-        if (xQueueReceive(gpio_evt_queue, &event, portTICK_RATE_MS * 0)) {
+        if (xQueueReceive(gpio_evt_queue, &event, 0)) {
             if (event == BOARD_EVENT_RECORD && m_board_is_recording == false) {
                 m_board_is_recording = true;
 
@@ -304,7 +303,6 @@ void app_main() {
 
                 ESP_LOGI(TAG, "[6.0] start audio_pipeline");
                 audio_pipeline_run(pipeline_wav);
-                // audio_pipeline_run(pipeline_des);
 
             } else if (event == BOARD_EVENT_STOP_RECORD && m_board_is_recording == true) {
                 if (pipeline_wav) {
@@ -313,15 +311,8 @@ void app_main() {
                     audio_pipeline_terminate(pipeline_wav);
                     audio_pipeline_reset_ringbuffer(pipeline_wav);
                     audio_pipeline_reset_elements(pipeline_wav);
-                    //////
-                    // audio_pipeline_stop(pipeline_des);
-                    // audio_pipeline_wait_for_stop(pipeline_des);
-                    // audio_pipeline_terminate(pipeline_des);
-                    // audio_pipeline_reset_ringbuffer(pipeline_des);
-                    // audio_pipeline_reset_elements(pipeline_des);
 
-                    // encrypt file
-                    // encrypt_wav("/sdcard/rec_out.wav", "/sdcard/rec_des.wav");
+                    encrypt_wav("/sdcard/rec_out.wav", "/sdcard/rec_des.wav");
                     ESP_LOGI(TAG, "[8.0] Stop audio_pipeline");
                     vTaskDelay(portTICK_RATE_MS * 5000); // wait 5 second before next record
                 } else {
@@ -359,7 +350,6 @@ void app_main() {
         } else {
             timer_signal_off_count = 0;
         }
-        // ESP_LOGI(TAG, "Sound trigger level: %u", (unsigned int)sound_trig_level);
-        vTaskDelay(portTICK_RATE_MS * 100);
+        vTaskDelay(500 / portTICK_RATE_MS);
     }
 }
