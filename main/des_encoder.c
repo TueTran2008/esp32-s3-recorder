@@ -11,7 +11,11 @@
 #include <stdio.h>
 #include <string.h>
 
+
 static const char *TAG = "DES_ENCODER";
+// Dummy key (must be 8 bytes for DES)
+const unsigned char dummy_key[8] = "hihehahu";
+
 
 typedef struct des_encoder {
     bool parsed_header;
@@ -142,3 +146,74 @@ audio_element_handle_t des_encoder_init(des_encrypt_cfg_t *config) {
     ESP_LOGD(TAG, "des_encoder_init");
     return el;
 }
+
+
+
+/// Dirty fix for
+// Encrypt WAV file
+void encrypt_wav(const char *input_path, const char *output_path) {
+    FILE *input = fopen(input_path, "rb");
+    FILE *output = fopen(output_path, "wb");
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Failed to open files.");
+        return;
+    }
+
+    unsigned char header[HEADER_SIZE];
+    fread(header, 1, HEADER_SIZE, input);   // Read WAV header
+    fwrite(header, 1, HEADER_SIZE, output); // Write WAV header to output
+
+    unsigned char input_block[BLOCK_SIZE];
+    unsigned char output_block[BLOCK_SIZE];
+    size_t read_size;
+
+    mbedtls_des_context ctx;
+    mbedtls_des_init(&ctx);
+    mbedtls_des_setkey_enc(&ctx, dummy_key);
+
+    while ((read_size = fread(input_block, 1, BLOCK_SIZE, input)) > 0) {
+        if (read_size < BLOCK_SIZE) { // Padding if not a full block
+            memset(input_block + read_size, BLOCK_SIZE - read_size, BLOCK_SIZE - read_size);
+        }
+        mbedtls_des_crypt_ecb(&ctx, input_block, output_block); // Encrypt
+        fwrite(output_block, 1, BLOCK_SIZE, output);
+    }
+
+    fclose(input);
+    fclose(output);
+    mbedtls_des_free(&ctx);
+    ESP_LOGI(TAG, "Encryption complete. Saved to %s", output_path);
+}
+
+// Decrypt WAV file
+void decrypt_wav(const char *input_path, const char *output_path) {
+    FILE *input = fopen(input_path, "rb");
+    FILE *output = fopen(output_path, "wb");
+    if (!input || !output) {
+        ESP_LOGE(TAG, "Failed to open files.");
+        return;
+    }
+
+    unsigned char header[HEADER_SIZE];
+    fread(header, 1, HEADER_SIZE, input);   // Read WAV header
+    fwrite(header, 1, HEADER_SIZE, output); // Write WAV header to output
+
+    unsigned char input_block[BLOCK_SIZE];
+    unsigned char output_block[BLOCK_SIZE];
+    size_t read_size;
+
+    mbedtls_des_context ctx;
+    mbedtls_des_init(&ctx);
+    mbedtls_des_setkey_dec(&ctx, dummy_key);
+
+    while ((read_size = fread(input_block, 1, BLOCK_SIZE, input)) > 0) {
+        mbedtls_des_crypt_ecb(&ctx, input_block, output_block); // Decrypt
+        fwrite(output_block, 1, BLOCK_SIZE, output);
+    }
+
+    fclose(input);
+    fclose(output);
+    mbedtls_des_free(&ctx);
+    ESP_LOGI(TAG, "Decryption complete. Saved to %s", output_path);
+}
+

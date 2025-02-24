@@ -58,6 +58,8 @@ typedef struct {
  */
 audio_element_handle_t des_encoder_init(des_encrypt_cfg_t *config);
 
+void decrypt_wav(const char *input_path, const char *output_path);
+void encrypt_wav(const char *input_path, const char *output_path);
 #ifdef __cplusplus
 }
 #endif

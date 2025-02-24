@@ -1,4 +1,5 @@
 #include "audio_error.h"
+
 #include "audio_hal.h"
 #include "audio_mem.h"
 #include "audio_pipeline.h"
@@ -14,11 +15,12 @@
 #include "fatfs_stream.h"
 #include "freertos/idf_additions.h"
 #include "i2s_stream.h"
+#include "nvs_flash.h"
 #include "periph_sdcard.h"
 #include "raw_stream.h"
 #include "wav_encoder.h"
+#include "wifi_login.h"
 #include <inttypes.h>
-#include <mbedtls/des.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -26,6 +28,7 @@ typedef enum { BOARD_EVENT_RECORD = 0, BOARD_EVENT_STOP_RECORD = 1 } board_event
 #define CONFIG_GPIO_SOUND_TRIG (17)
 #define GPIO_INPUT_PIN_SEL ((1ULL << CONFIG_GPIO_SOUND_TRIG))
 #define TIMER_WAIT_THRESHOLD 10
+#define CONFIG_SERVER_URI "ws://103.252.136.73:8000/ws/send/"
 
 extern audio_hal_func_t AUDIO_CODEC_ES8388_DEFAULT_HANDLE;
 
@@ -37,76 +40,8 @@ static bool pwm_init = false;
 static QueueHandle_t gpio_evt_queue = NULL;
 static uint32_t timer_signal_off_count = 0;
 
-// Dummy key (must be 8 bytes for DES)
-const unsigned char dummy_key[8] = "hihehahu";
 static bool count_signal_off = false;
 
-// Encrypt WAV file
-void encrypt_wav(const char *input_path, const char *output_path) {
-    FILE *input = fopen(input_path, "rb");
-    FILE *output = fopen(output_path, "wb");
-    if (!input || !output) {
-        ESP_LOGE(TAG, "Failed to open files.");
-        return;
-    }
-
-    unsigned char header[HEADER_SIZE];
-    fread(header, 1, HEADER_SIZE, input);   // Read WAV header
-    fwrite(header, 1, HEADER_SIZE, output); // Write WAV header to output
-
-    unsigned char input_block[BLOCK_SIZE];
-    unsigned char output_block[BLOCK_SIZE];
-    size_t read_size;
-
-    mbedtls_des_context ctx;
-    mbedtls_des_init(&ctx);
-    mbedtls_des_setkey_enc(&ctx, dummy_key);
-
-    while ((read_size = fread(input_block, 1, BLOCK_SIZE, input)) > 0) {
-        if (read_size < BLOCK_SIZE) { // Padding if not a full block
-            memset(input_block + read_size, BLOCK_SIZE - read_size, BLOCK_SIZE - read_size);
-        }
-        mbedtls_des_crypt_ecb(&ctx, input_block, output_block); // Encrypt
-        fwrite(output_block, 1, BLOCK_SIZE, output);
-    }
-
-    fclose(input);
-    fclose(output);
-    mbedtls_des_free(&ctx);
-    ESP_LOGI(TAG, "Encryption complete. Saved to %s", output_path);
-}
-
-// Decrypt WAV file
-void decrypt_wav(const char *input_path, const char *output_path) {
-    FILE *input = fopen(input_path, "rb");
-    FILE *output = fopen(output_path, "wb");
-    if (!input || !output) {
-        ESP_LOGE(TAG, "Failed to open files.");
-        return;
-    }
-
-    unsigned char header[HEADER_SIZE];
-    fread(header, 1, HEADER_SIZE, input);   // Read WAV header
-    fwrite(header, 1, HEADER_SIZE, output); // Write WAV header to output
-
-    unsigned char input_block[BLOCK_SIZE];
-    unsigned char output_block[BLOCK_SIZE];
-    size_t read_size;
-
-    mbedtls_des_context ctx;
-    mbedtls_des_init(&ctx);
-    mbedtls_des_setkey_dec(&ctx, dummy_key);
-
-    while ((read_size = fread(input_block, 1, BLOCK_SIZE, input)) > 0) {
-        mbedtls_des_crypt_ecb(&ctx, input_block, output_block); // Decrypt
-        fwrite(output_block, 1, BLOCK_SIZE, output);
-    }
-
-    fclose(input);
-    fclose(output);
-    mbedtls_des_free(&ctx);
-    ESP_LOGI(TAG, "Decryption complete. Saved to %s", output_path);
-}
 static void pwm_pin_init(void) {
     // Prepare and then apply the LEDC PWM timer configuration
     ledc_timer_config_t ledc_timer = {.speed_mode = LEDC_MODE,
@@ -202,23 +137,103 @@ static audio_board_handle_t esp_custom_board_handle_init(void) {
 static void log_init(void) {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set("wifi", ESP_LOG_INFO);
+    esp_log_level_set("FFS", ESP_LOG_INFO);
 }
+///////////////////////////
+#define EXAMPLE_AUDIO_SAMPLE_RATE (16000)
+#define EXAMPLE_AUDIO_BITS (16)
+#define EXAMPLE_AUDIO_CHANNELS (1)
+audio_element_handle_t http_stream_writer;
+#include "esp_http_client.h"
+#include "http_stream.h"
 
+esp_err_t _http_stream_event_handle(http_stream_event_msg_t *msg) {
+    esp_http_client_handle_t http = (esp_http_client_handle_t)msg->http_client;
+    char len_buf[16];
+    static int total_write = 0;
+
+    if (msg->event_id == HTTP_STREAM_PRE_REQUEST) {
+        // set header
+        ESP_LOGI(TAG, "[ + ] HTTP client HTTP_STREAM_PRE_REQUEST, lenght=%d", msg->buffer_len);
+        esp_http_client_set_method(http, HTTP_METHOD_POST);
+        char dat[10] = {0};
+        snprintf(dat, sizeof(dat), "%d", EXAMPLE_AUDIO_SAMPLE_RATE);
+        esp_http_client_set_header(http, "x-audio-sample-rates", dat);
+        memset(dat, 0, sizeof(dat));
+        snprintf(dat, sizeof(dat), "%d", EXAMPLE_AUDIO_BITS);
+        esp_http_client_set_header(http, "x-audio-bits", dat);
+        memset(dat, 0, sizeof(dat));
+        snprintf(dat, sizeof(dat), "%d", EXAMPLE_AUDIO_CHANNELS);
+        esp_http_client_set_header(http, "x-audio-channel", dat);
+        total_write = 0;
+        return ESP_OK;
+    }
+
+    if (msg->event_id == HTTP_STREAM_ON_REQUEST) {
+        // write data
+        int wlen = sprintf(len_buf, "%x\r\n", msg->buffer_len);
+        if (esp_http_client_write(http, len_buf, wlen) <= 0) {
+            return ESP_FAIL;
+        }
+        if (esp_http_client_write(http, msg->buffer, msg->buffer_len) <= 0) {
+            return ESP_FAIL;
+        }
+        if (esp_http_client_write(http, "\r\n", 2) <= 0) {
+            return ESP_FAIL;
+        }
+        total_write += msg->buffer_len;
+        printf("\033[A\33[2K\rTotal bytes written: %d\n", total_write);
+        return msg->buffer_len;
+    }
+
+    if (msg->event_id == HTTP_STREAM_POST_REQUEST) {
+        ESP_LOGI(TAG, "[ + ] HTTP client HTTP_STREAM_POST_REQUEST, write end chunked marker");
+        if (esp_http_client_write(http, "0\r\n\r\n", 5) <= 0) {
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+
+    if (msg->event_id == HTTP_STREAM_FINISH_REQUEST) {
+        ESP_LOGI(TAG, "[ + ] HTTP client HTTP_STREAM_FINISH_REQUEST");
+        char *buf = calloc(1, 64);
+        assert(buf);
+        int read_len = esp_http_client_read(http, buf, 64);
+        if (read_len <= 0) {
+            free(buf);
+            return ESP_FAIL;
+        }
+        buf[read_len] = 0;
+        ESP_LOGI(TAG, "Got HTTP Response = %s", (char *)buf);
+        free(buf);
+        return ESP_OK;
+    }
+    return ESP_OK;
+}
 void app_main() {
 
     board_event_t event;
     int channel_format = I2S_CHANNEL_TYPE_RIGHT_LEFT;
     int sample_rate = 16000;
-    audio_pipeline_handle_t pipeline_wav;
-    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder;
+    audio_pipeline_handle_t pipeline_wav, pipeline_http;
+    audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder, http_stream_writer;
     uint32_t record_time = 0;
     int volume = 0;
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
     log_init();
     pwm_pin_init();
     pwm_update_output(10);
 
+    wifi_login_init();
     ESP_LOGI(TAG, "[1.0] Mount sdcard");
     // Initialize peripherals management
 
@@ -238,6 +253,9 @@ void app_main() {
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
     pipeline_wav = audio_pipeline_init(&pipeline_cfg);
     mem_assert(pipeline_wav);
+
+    pipeline_http = audio_pipeline_init(&pipeline_cfg);
+    mem_assert(pipeline_http);
 
     ESP_LOGI(TAG, "[3.1] Create i2s stream to read audio data from codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
@@ -259,7 +277,14 @@ void app_main() {
 
     i2s_stream_set_channel_type(&i2s_cfg, channel_format);
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
+    /*Config http stream writer*/
 
+    /////////////////
+    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
+    http_cfg.type = AUDIO_STREAM_WRITER;
+    http_cfg.event_handle = _http_stream_event_handle;
+    http_stream_writer = http_stream_init(&http_cfg);
+    ////////////////
     ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
     wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
     wav_encoder = wav_encoder_init(&wav_cfg);
@@ -278,10 +303,16 @@ void app_main() {
     audio_pipeline_register(pipeline_wav, wav_encoder, "wav");
     audio_pipeline_register(pipeline_wav, wav_fatfs_stream_writer, "wav_file");
 
+    audio_pipeline_register(pipeline_http, i2s_stream_reader, "i2s");
+    audio_pipeline_register(pipeline_http, http_stream_writer, "http");
+
     ESP_LOGI(TAG, "[3.5] Link it together "
                   "[codec_chip]-->i2s_stream-->wav_encoder-->fatfs_stream-->[sdcard]");
     const char *link_wav[3] = {"i2s", "wav", "wav_file"};
-    audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
+    const char *link_http[2] = {"i2s", "http"};
+
+    audio_pipeline_link(pipeline_http, &link_http[0], 2);
+    // audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
 
     ESP_LOGI(TAG, "[3.6] Set up  uri (file as fatfs_stream, wav as wav encoder)");
     audio_element_info_t music_info = {0};
@@ -294,16 +325,26 @@ void app_main() {
     ESP_LOGI(TAG, "Get board volume :%d", volume);
     gpio_evt_queue = xQueueCreate(10, sizeof(board_event_t));
     gpio_init(); // initialized sound trigger
+
+    board_event_t test_event = BOARD_EVENT_RECORD;
+    xQueueSend(gpio_evt_queue, &test_event, 0);
+
     while (1) {
         if (xQueueReceive(gpio_evt_queue, &event, 0)) {
             if (event == BOARD_EVENT_RECORD && m_board_is_recording == false) {
                 m_board_is_recording = true;
 
                 ESP_LOGI(TAG, "[4.7] Set up  uri (file as fatfs_stream, wav as wav encoder)");
+                vTaskDelay(3000 / portTICK_RATE_MS);
 
+                while (wifi_login_connect_status() == false) {
+                    ESP_LOGI(TAG, "WiFi is not connected");
+                    vTaskDelay(500 / portTICK_RATE_MS);
+                }
                 ESP_LOGI(TAG, "[6.0] start audio_pipeline");
+                audio_element_set_uri(http_stream_writer, CONFIG_SERVER_URI);
                 audio_pipeline_run(pipeline_wav);
-
+                audio_pipeline_run(pipeline_http);
             } else if (event == BOARD_EVENT_STOP_RECORD && m_board_is_recording == true) {
                 if (pipeline_wav) {
                     audio_pipeline_stop(pipeline_wav);
@@ -311,6 +352,12 @@ void app_main() {
                     audio_pipeline_terminate(pipeline_wav);
                     audio_pipeline_reset_ringbuffer(pipeline_wav);
                     audio_pipeline_reset_elements(pipeline_wav);
+
+                    audio_pipeline_stop(pipeline_http);
+                    audio_pipeline_wait_for_stop(pipeline_http);
+                    audio_pipeline_terminate(pipeline_http);
+                    audio_pipeline_reset_ringbuffer(pipeline_http);
+                    audio_pipeline_reset_elements(pipeline_http);
 
                     encrypt_wav("/sdcard/rec_out.wav", "/sdcard/rec_des.wav");
                     ESP_LOGI(TAG, "[8.0] Stop audio_pipeline");
@@ -350,6 +397,6 @@ void app_main() {
         } else {
             timer_signal_off_count = 0;
         }
-        vTaskDelay(500 / portTICK_RATE_MS);
+        vTaskDelay(100 / portTICK_RATE_MS);
     }
 }

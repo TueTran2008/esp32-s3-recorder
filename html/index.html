@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<body>
+<style>
+body {
+  background-color: linen;
+}
+
+h1 {
+  color: maroon;
+  margin-left: 40px;
+}
+</style>
+ <label for="ssid">SSID:</label>
+ <input type = "text" id="SSID"> <br><br>
+ <label for="PASSWORD">PASSWORD:</label>
+ <input type = "test" id="PASS" ><br><br>
+ <label for="wifi_auth_mode">Choose Auth Mode</label>
+
+ <select name="wifi_auth_mode" id="wifi_auth_mode">
+   <option value="0" >WIFI_AUTH_OPEN</option>
+   <option value="1">WIFI_AUTH_WEP</option>
+   <option value="2">WIFI_AUTH_WPA_PSK</option>
+   <option value="3">WIFI_AUTH_WPA2_PSK</option>
+   <option value="4">WIFI_AUTH_WPA_WPA2_PSK</option>
+   <option value="5">WIFI_AUTH_WPA2_ENTERPRISE</option>
+   <option value="6">WIFI_AUTH_WPA3_PSK</option>
+   <option value="7">AuWIFI_AUTH_WPA2_WPA3_PSKdi</option>
+   <option value="8">WIFI_AUTH_WAPI_PSK</option>
+   <option value="9">WIFI_AUTH_MAX</option>
+ </select>
+ <br><br>
+
+ <button onclick=" SendWifi()"> Login </Button>
+ <p id="test"></p>
+
+ <p>
+    <span >Connection State:</span>
+    <span id="wifi_state">Disconnected</span>
+</p>
+
+ <script>
+var xhttp1 = new XMLHttpRequest();
+ function SendWifi()
+ {
+  var ssid = document.getElementById("SSID").value;
+  var password = document.getElementById("PASS").value;
+  var auth = document.getElementById("wifi_auth_mode").value;
+  const obj = {SSID:ssid,PASS:password,AUTH:auth};
+  const myJson = JSON.stringify(obj);
+  xhttp1.open("POST","/wificonfig",true);
+  xhttp1.send(myJson);
+ }
+
+ var xhttp2 = new XMLHttpRequest();
+ xhttp2.onreadystatechange = function()
+{
+  const obj = JSON.parse(this.responseText);
+  var element1 = document.getElementById('wifi_state');
+  element1.innerText = obj.wifi_state;
+}
+setInterval(function ()
+{
+  xhttp2.open("GET","/wifi_state",true);
+  xhttp2.send();
+} ,4000);
+ </script>
+ </html>
+ </body>
