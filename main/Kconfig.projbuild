@@ -1,12 +1,29 @@
-menu "Example configuration"
-choice AUDIO_TYPE
-    prompt "Audio encoder file type"
-    default CHOICE_AMR_NB
-    help
-        Select a file type to save recording
-config CHOICE_AMR_NB
-    bool "amrnb"
-config CHOICE_AMR_WB
-    bool "amrwb"
-endchoice
+menu "Example Configuration"
+
+# config WIFI_SSID
+#     string "WiFi SSID"
+# 	default "myssid"
+# 	help
+# 		SSID (network name) for the example to connect to.
+#
+# config WIFI_PASSWORD
+#     string "WiFi Password"
+#     default "mypassword"
+# 	help
+# 		WiFi password (WPA or WPA2) for the example to use.
+#
+# 		Can be left blank if the network has no security set.
+
+config TCP_URL
+    string "TCP URL"
+    default "192.168.4.1"
+	help
+		TCP Server Address
+
+config TCP_PORT
+    int "TCP PORT"
+    default "8080"
+	help
+		TCP Port Number to connect
+
 endmenu

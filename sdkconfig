@@ -529,11 +529,11 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
-# Example configuration
+# Example Configuration
 #
-CONFIG_CHOICE_AMR_NB=y
-# CONFIG_CHOICE_AMR_WB is not set
-# end of Example configuration
+CONFIG_TCP_URL="192.168.1.115"
+CONFIG_TCP_PORT=8080
+# end of Example Configuration
 
 #
 # Audio HAL
