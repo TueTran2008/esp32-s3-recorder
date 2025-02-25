@@ -22,6 +22,8 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <string.h>
+#include "periph_wifi.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 // #include "esp_event_loop.h"
 
@@ -153,6 +155,7 @@ static void log_init(void) {
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("wifi", ESP_LOG_INFO);
     esp_log_level_set("FFS", ESP_LOG_INFO);
+    esp_log_level_set("TCP_STREAM", ESP_LOG_DEBUG);
 }
 ///////////////////////////
 
@@ -164,23 +167,18 @@ static void board_event_handler(void *handler_arg, esp_event_base_t base, int32_
         if (base == BOARD_EVENT_BASE && event_id == BOARD_EVENT_RECORD) {
             ESP_LOGI(TAG, "[4.7] Set up  uri (file as fatfs_stream, wav as wav encoder)");
             ESP_LOGI(TAG, "[6.0] start audio_pipeline");
-                while (wifi_login_connect_status() == false) {
-                    ESP_LOGI(TAG, "WiFi is not connected");
-                    vTaskDelay(500 / portTICK_RATE_MS);
-                }
-            vTaskDelay(3000 / portTICK_RATE_MS);
-            audio_pipeline_run(pipeline_wav);
+            // audio_pipeline_run(pipeline_wav);
             audio_pipeline_run(pipeline_tcp);
             state = BOARD_STATE_RECORDING;
         }
         break;
     case BOARD_STATE_RECORDING:
         if (base == BOARD_EVENT_BASE && event_id == BOARD_EVENT_STOP_RECORD) {
-            audio_pipeline_stop(pipeline_wav);
-            audio_pipeline_wait_for_stop(pipeline_wav);
-            audio_pipeline_terminate(pipeline_wav);
-            audio_pipeline_reset_ringbuffer(pipeline_wav);
-            audio_pipeline_reset_elements(pipeline_wav);
+            // audio_pipeline_stop(pipeline_wav);
+            // audio_pipeline_wait_for_stop(pipeline_wav);
+            // audio_pipeline_terminate(pipeline_wav);
+            // audio_pipeline_reset_ringbuffer(pipeline_wav);
+            // audio_pipeline_reset_elements(pipeline_wav);
 
             audio_pipeline_stop(pipeline_tcp);
             audio_pipeline_wait_for_stop(pipeline_tcp);
@@ -197,34 +195,66 @@ static void board_event_handler(void *handler_arg, esp_event_base_t base, int32_
 
 static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_RECORD, NULL, 0,
-                      portMAX_DELAY);
+        // esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_RECORD, NULL, 0,
+        //               portMAX_DELAY)
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGE(TAG, "DARWINN got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+
     }
 }
+
+static void timer_board_callback(void *arg) {
+    // ESP_LOGI(TAG,"Timer expired! Posting event...\n");
+    esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_STOP_RECORD, NULL, 0,
+                      portMAX_DELAY);
+    ESP_LOGI(TAG, "TIMER 10S callback stop streaming");
+}
+
 void app_main() {
     int channel_format = I2S_CHANNEL_TYPE_RIGHT_LEFT;
     int sample_rate = 16000;
     int volume = 0;
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
 
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
         ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+        err = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
-    esp_event_loop_args_t loop_args = {.queue_size = 80, .task_name = "event_task", .task_priority = uxTaskPriorityGet(NULL), .task_stack_size = 4096 * 6, .task_core_id = tskNO_AFFINITY};
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
+    ESP_ERROR_CHECK(esp_netif_init());
+#else
+    tcpip_adapter_init();
+#endif
+    esp_event_loop_args_t loop_args = {.queue_size = 5, .task_name = "event_task", .task_priority = uxTaskPriorityGet(NULL), .task_stack_size = 3072, .task_core_id = tskNO_AFFINITY};
 
     esp_event_loop_create(&loop_args, &event_loop_handle);
-    log_init();
-    pwm_pin_init();
-    pwm_update_output(10);
 
-    wifi_login_init();
+    log_init();
+    // pwm_pin_init();
+    // pwm_update_output(10);
+
+    //wifi_login_init();
     ESP_LOGI(TAG, "[1.0] Mount sdcard");
     // Initialize peripherals management
 
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+
+    periph_wifi_cfg_t wifi_cfg = {
+        .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
+        .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
+    };
+
+    esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
+
+    // Start wifi & button peripheral
+    esp_periph_start(set, wifi_handle);
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL, &instance_got_ip));
+
+    periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
     // Initialize SD Card peripheral
     audio_board_sdcard_init(set, SD_MODE_SPI);
 
@@ -238,8 +268,8 @@ void app_main() {
 
     ESP_LOGI(TAG, "[3.0] Create audio pipeline_wav for recording");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipeline_wav = audio_pipeline_init(&pipeline_cfg);
-    mem_assert(pipeline_wav);
+    // pipeline_wav = audio_pipeline_init(&pipeline_cfg);
+    // mem_assert(pipeline_wav);
 
     pipeline_tcp = audio_pipeline_init(&pipeline_cfg);
     mem_assert(pipeline_tcp);
@@ -272,44 +302,45 @@ void app_main() {
     tcp_cfg.type = AUDIO_STREAM_WRITER;
     tcp_cfg.port = CONFIG_TCP_PORT;
     tcp_cfg.host = CONFIG_TCP_URL;
+    tcp_cfg.ext_stack = false;
     tcp_stream_writer = tcp_stream_init(&tcp_cfg);
     AUDIO_NULL_CHECK(TAG, tcp_stream_writer, return);
     ////////////////
-    ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
-    wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
-    wav_encoder = wav_encoder_init(&wav_cfg);
+    // ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
+    // wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
+    // wav_encoder = wav_encoder_init(&wav_cfg);
 
-    ESP_LOGI(TAG, "[3.3] Create fatfs stream to write data to sdcard");
-    fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
-    fatfs_cfg.type = AUDIO_STREAM_WRITER;
-    wav_fatfs_stream_writer = fatfs_stream_init(&fatfs_cfg);
+    // ESP_LOGI(TAG, "[3.3] Create fatfs stream to write data to sdcard");
+    // fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
+    // fatfs_cfg.type = AUDIO_STREAM_WRITER;
+    // wav_fatfs_stream_writer = fatfs_stream_init(&fatfs_cfg);
 
-    audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
-    audio_element_getinfo(i2s_stream_reader, &info);
-    audio_element_setinfo(wav_fatfs_stream_writer, &info);
+    // audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
+    // audio_element_getinfo(i2s_stream_reader, &info);
+    // audio_element_setinfo(wav_fatfs_stream_writer, &info);
 
     ESP_LOGI(TAG, "[3.4] Register all elements to audio pipeline");
-    audio_pipeline_register(pipeline_wav, i2s_stream_reader, "i2s");
-    audio_pipeline_register(pipeline_wav, wav_encoder, "wav");
-    audio_pipeline_register(pipeline_wav, wav_fatfs_stream_writer, "wav_file");
+    // audio_pipeline_register(pipeline_wav, i2s_stream_reader, "i2s");
+    // audio_pipeline_register(pipeline_wav, wav_encoder, "wav");
+    // audio_pipeline_register(pipeline_wav, wav_fatfs_stream_writer, "wav_file");
 
     audio_pipeline_register(pipeline_tcp, i2s_stream_reader, "i2s");
     audio_pipeline_register(pipeline_tcp, tcp_stream_writer, "tcp");
 
     ESP_LOGI(TAG, "[3.5] Link it together "
                   "[codec_chip]-->i2s_stream-->wav_encoder-->fatfs_stream-->[sdcard]");
-    const char *link_wav[3] = {"i2s", "wav", "wav_file"};
+    // const char *link_wav[3] = {"i2s", "wav", "wav_file"};
     const char *link_tcp[2] = {"i2s", "tcp"};
 
     audio_pipeline_link(pipeline_tcp, &link_tcp[0], 2);
-    audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
+    // audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
 
     ESP_LOGI(TAG, "[3.6] Set up  uri (file as fatfs_stream, wav as wav encoder)");
     audio_element_info_t music_info = {0};
     audio_element_getinfo(i2s_stream_reader, &music_info);
     ESP_LOGI(TAG, "[ * ] Save the recording info to the fatfs stream writer, sample_rates=%d, bits=%d, ch=%d", music_info.sample_rates, music_info.bits, music_info.channels);
-    audio_element_setinfo(wav_fatfs_stream_writer, &music_info);
-    audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
+    // audio_element_setinfo(wav_fatfs_stream_writer, &music_info);
+    // audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
 
     ESP_LOGI(TAG, "Get board volume :%d", volume);
         //             //
@@ -318,8 +349,18 @@ void app_main() {
     // gpio_init(); // initialized sound trigger
 
     esp_event_handler_instance_register_with(event_loop_handle, BOARD_EVENT_BASE, ESP_EVENT_ANY_ID, board_event_handler, NULL, NULL);
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL, NULL));
 
+
+        esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_RECORD, NULL, 0,
+                      portMAX_DELAY);
+
+    esp_timer_handle_t timer_handle;
+    const esp_timer_create_args_t timer_args = {
+        .callback = &timer_board_callback,
+        .name = "my_timer"
+    };
+    esp_timer_create(&timer_args, &timer_handle);
+    esp_timer_start_once(timer_handle, 10000000);
     // board_event_t test_event = BOARD_EVENT_RECORD;
     // xQueueSend(gpio_evt_queue, &test_event, 0);
 
