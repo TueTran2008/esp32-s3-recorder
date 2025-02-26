@@ -263,7 +263,7 @@ void app_main() {
     audio_board_handle_t board_handle = esp_custom_board_handle_init();
     audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
 
-    audio_hal_set_volume(board_handle->audio_hal, 80);
+    audio_hal_set_volume(board_handle->audio_hal, 60);
     audio_hal_get_volume(board_handle->audio_hal, &volume);
 
     ESP_LOGI(TAG, "[3.0] Create audio pipeline_wav for recording");
@@ -287,9 +287,9 @@ void app_main() {
     // i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
 #else
-    i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
-    i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-    i2s_cfg.i2s_config.sample_rate = sample_rate;
+    // i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
+    // i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    // i2s_cfg.i2s_config.sample_rate = sample_rate;
 #endif // (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
 
     i2s_stream_set_channel_type(&i2s_cfg, channel_format);
@@ -306,22 +306,22 @@ void app_main() {
     tcp_stream_writer = tcp_stream_init(&tcp_cfg);
     AUDIO_NULL_CHECK(TAG, tcp_stream_writer, return);
     ////////////////
-    // ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
-    // wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
-    // wav_encoder = wav_encoder_init(&wav_cfg);
+    ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
+    wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
+    wav_encoder = wav_encoder_init(&wav_cfg);
 
     // ESP_LOGI(TAG, "[3.3] Create fatfs stream to write data to sdcard");
     // fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
     // fatfs_cfg.type = AUDIO_STREAM_WRITER;
     // wav_fatfs_stream_writer = fatfs_stream_init(&fatfs_cfg);
 
-    // audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
-    // audio_element_getinfo(i2s_stream_reader, &info);
+    audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
+    audio_element_getinfo(i2s_stream_reader, &info);
     // audio_element_setinfo(wav_fatfs_stream_writer, &info);
 
     ESP_LOGI(TAG, "[3.4] Register all elements to audio pipeline");
     // audio_pipeline_register(pipeline_wav, i2s_stream_reader, "i2s");
-    // audio_pipeline_register(pipeline_wav, wav_encoder, "wav");
+    // audio_pipeline_register(pipeline_tcp, wav_encoder, "wav");
     // audio_pipeline_register(pipeline_wav, wav_fatfs_stream_writer, "wav_file");
 
     audio_pipeline_register(pipeline_tcp, i2s_stream_reader, "i2s");
@@ -360,7 +360,7 @@ void app_main() {
         .name = "my_timer"
     };
     esp_timer_create(&timer_args, &timer_handle);
-    esp_timer_start_once(timer_handle, 10000000);
+    // esp_timer_start_once(timer_handle, 10000000);
     // board_event_t test_event = BOARD_EVENT_RECORD;
     // xQueueSend(gpio_evt_queue, &test_event, 0);
 
