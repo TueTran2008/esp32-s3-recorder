@@ -57,6 +57,7 @@ static esp_event_loop_handle_t event_loop_handle;
 static bool count_signal_off = false;
 static audio_pipeline_handle_t pipeline_wav, pipeline_tcp;
 static audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder, tcp_stream_writer, opus_encoder;
+static esp_timer_handle_t timer_handle;
 
 static void pwm_pin_init(void) {
     // Prepare and then apply the LEDC PWM timer configuration
@@ -165,6 +166,7 @@ static void board_event_handler(void *handler_arg, esp_event_base_t base, int32_
 
     case BOARD_STATE_IDLE:
         if (base == BOARD_EVENT_BASE && event_id == BOARD_EVENT_RECORD) {
+            esp_timer_stop(timer_handle);
             ESP_LOGI(TAG, "[4.7] Set up  uri (file as fatfs_stream, wav as wav encoder)");
             ESP_LOGI(TAG, "[6.0] start audio_pipeline");
             // audio_pipeline_run(pipeline_wav);
@@ -186,6 +188,7 @@ static void board_event_handler(void *handler_arg, esp_event_base_t base, int32_
             audio_pipeline_reset_ringbuffer(pipeline_tcp);
             audio_pipeline_reset_elements(pipeline_tcp);
             state = BOARD_STATE_IDLE;
+            esp_timer_start_once(timer_handle, 3000000);
         }
         break;
     default:
@@ -204,7 +207,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
 
 static void timer_board_callback(void *arg) {
     // ESP_LOGI(TAG,"Timer expired! Posting event...\n");
-    esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_STOP_RECORD, NULL, 0, portMAX_DELAY);
+    esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_RECORD, NULL, 0, portMAX_DELAY);
     ESP_LOGI(TAG, "TIMER 10S callback stop streaming");
 }
 
@@ -348,17 +351,46 @@ void app_main() {
     // audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
 
     ESP_LOGI(TAG, "Get board volume :%d", volume);
-    //             //
 
-    // gpio_evt_queue = xQueueCreate(10, sizeof(board_event_t));
-    // gpio_init(); // initialized sound trigger
+    const esp_timer_create_args_t timer_args = {.callback = &timer_board_callback, .name = "my_timer"};
+    esp_timer_create(&timer_args, &timer_handle);
 
     esp_event_handler_instance_register_with(event_loop_handle, BOARD_EVENT_BASE, ESP_EVENT_ANY_ID, board_event_handler, NULL, NULL);
 
     esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_RECORD, NULL, 0, portMAX_DELAY);
 
-    esp_timer_handle_t timer_handle;
-    const esp_timer_create_args_t timer_args = {.callback = &timer_board_callback, .name = "my_timer"};
-    esp_timer_create(&timer_args, &timer_handle);
     // esp_timer_start_once(timer_handle, 10000000);
+    // const char *link_wav[3] = {"i2s", "wav", "wav_file"};
+    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
+    audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
+
+    ESP_LOGI(TAG, "[4.1] Listening event from all elements of pipeline");
+    audio_pipeline_set_listener(pipeline_tcp, evt);
+
+    ESP_LOGI(TAG, "[4.2] Listening event from peripherals");
+    audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
+
+    while (1) {
+        audio_event_iface_msg_t msg;
+        esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "[ * ] Event interface error : %d", ret);
+            continue;
+        }
+        ESP_LOGI(TAG, "[ * ] Event received:");
+        ESP_LOGI(TAG, "    Source Type: %d", msg.source_type);
+        ESP_LOGI(TAG, "    Command: %d", msg.cmd);
+        ESP_LOGI(TAG, "    Source Handle: %p", msg.source);
+        ESP_LOGI(TAG, "    Data: %p", msg.data);
+        ESP_LOGI(TAG, "    Data Length: %d", msg.data_len);
+        // Handle specific events
+
+        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *) tcp_stream_writer
+            && msg.cmd == AEL_MSG_CMD_REPORT_STATUS
+            && (((int)msg.data == AEL_STATUS_STATE_STOPPED) || ((int)msg.data == AEL_STATUS_ERROR_OUTPUT) || ((int)msg.data == AEL_STATUS_ERROR_OPEN)  || ((int)msg.data == AEL_STATUS_ERROR_INPUT) || ((int)msg.data == AEL_STATUS_ERROR_PROCESS) || ((int)msg.data == AEL_STATUS_ERROR_TIMEOUT) || ((int)msg.data == AEL_STATUS_ERROR_CLOSE) || ((int)msg.data == AEL_STATUS_ERROR_UNKNOWN)  )) {
+            ESP_LOGE(TAG, "TCP Stop :%d", (int)msg.data);
+    esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_STOP_RECORD, NULL, 0, portMAX_DELAY);
+
+        }
+    }
 }
