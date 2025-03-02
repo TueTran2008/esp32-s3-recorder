@@ -26,8 +26,8 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <string.h>
-// #include "esp_event_loop.h"
-
+#include "equalizer.h"
+#include "raw_opus_encoder.h"
 /**
  * @brief Base event for LED 1.
  */
@@ -39,10 +39,11 @@ ESP_EVENT_DECLARE_BASE(BOARD_EVENT_BASE);
 ESP_EVENT_DEFINE_BASE(BOARD_EVENT_BASE);
 
 typedef enum { BOARD_EVENT_RECORD = 0, BOARD_EVENT_STOP_RECORD = 1 } board_event_t;
-#define CONFIG_GPIO_SOUND_TRIG (17)
-#define GPIO_INPUT_PIN_SEL ((1ULL << CONFIG_GPIO_SOUND_TRIG))
-#define TIMER_WAIT_THRESHOLD 10
-#define CONFIG_SERVER_URI "ws://103.252.136.73:8000/ws/send/"
+
+#define CODEC_SAMPLE_RATE 48000
+#define CODEC_CHANNEL 2
+#define CODEC_BIT_RATE 48000 // 32000
+#define OPUS_COMPLEXITY 5    // 5: nghe như MIDI :(, thử để 10 cho tăng chất lượng xem sao! (set >= 8 là treo do CPU 0: el-opus)
 
 extern audio_hal_func_t AUDIO_CODEC_ES8388_DEFAULT_HANDLE;
 
@@ -56,85 +57,11 @@ static uint32_t timer_signal_off_count = 0;
 static esp_event_loop_handle_t event_loop_handle;
 static bool count_signal_off = false;
 static audio_pipeline_handle_t pipeline_wav, pipeline_tcp;
-static audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder, tcp_stream_writer, opus_encoder;
+static audio_element_handle_t wav_fatfs_stream_writer, i2s_stream_reader, wav_encoder, tcp_stream_writer, opus_encoder, equalizer;
 static esp_timer_handle_t timer_handle;
 
-static void pwm_pin_init(void) {
-    // Prepare and then apply the LEDC PWM timer configuration
-    ledc_timer_config_t ledc_timer = {.speed_mode = LEDC_MODE,
-                                      .duty_resolution = LEDC_DUTY_RES,
-                                      .timer_num = LEDC_TIMER,
-                                      .freq_hz = LEDC_FREQUENCY, // Set output frequency at 4 kHz
-                                      .clk_cfg = LEDC_AUTO_CLK};
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    // Prepare and then apply the LEDC PWM channel configuration
-    ledc_channel_config_t ledc_channel = {.speed_mode = LEDC_MODE,
-                                          .channel = LEDC_CHANNEL,
-                                          .timer_sel = LEDC_TIMER,
-                                          .intr_type = LEDC_INTR_DISABLE,
-                                          .gpio_num = LEDC_OUTPUT_IO,
-                                          .duty = 0, // Set duty to 0%
-                                          .hpoint = 0};
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-    pwm_init = true;
-}
-
-static void IRAM_ATTR gpio_isr_handler(void *arg) {
-    uint32_t sound_trig_level = gpio_get_level(CONFIG_GPIO_SOUND_TRIG);
-    if (sound_trig_level == false) {
-        count_signal_off = false;
-        if (m_board_is_recording == false) {
-            static board_event_t event = BOARD_EVENT_RECORD;
-            xQueueSendFromISR(gpio_evt_queue, &event, NULL);
-        }
-    } else {
-        if (m_board_is_recording == true) {
-            count_signal_off = true;
-            timer_signal_off_count = 0;
-        }
-    }
-}
-
-static void pwm_update_output(uint32_t duty) {
-
-    if (pwm_init == false) {
-        pwm_pin_init();
-    }
-    if (duty > 100) {
-        duty = 100;
-        ESP_LOGW(TAG, "Set duty %u > 100 -> Duty = 100", (unsigned int)duty);
-    }
-    uint32_t l_duty = (duty * PWM_RESOLUTION) / 100;
-    ESP_LOGW(TAG, "ESP PWM value %u", (unsigned int)l_duty);
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, l_duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
-}
-
-static void gpio_init(void) {
-    gpio_config_t io_conf = {};
-
-    // bit mask of the pins, use GPIO4/5 here
-    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
-    // set as input mode
-    io_conf.mode = GPIO_MODE_INPUT;
-    // enable pull-up mode
-    io_conf.pull_up_en = 0;
-
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
-
-    gpio_config(&io_conf);
-
-    // change gpio interrupt type for one pin
-    gpio_set_intr_type(CONFIG_GPIO_SOUND_TRIG, GPIO_INTR_ANYEDGE);
-
-    // install gpio isr service
-    // gpio_install_isr_service(0); // need because the SD card already did this
-    // hook isr handler for specific gpio pin
-    gpio_isr_handler_add(CONFIG_GPIO_SOUND_TRIG, gpio_isr_handler, NULL);
-    ESP_LOGI(TAG, "Custom board Sound Trigger has been initialized");
-}
-
+#define EQUALZIER_DOWN  -36
+#define EQUALZIER_UP    24
 static audio_board_handle_t esp_custom_board_handle_init(void) {
     if (board_init) {
         ESP_LOGW(TAG, "Custom board audio hal has been initialized!");
@@ -153,10 +80,11 @@ static audio_board_handle_t esp_custom_board_handle_init(void) {
 
 static void log_init(void) {
     esp_log_level_set("*", ESP_LOG_DEBUG);
-    esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set(TAG, ESP_LOG_DEBUG);
     esp_log_level_set("wifi", ESP_LOG_INFO);
     esp_log_level_set("FFS", ESP_LOG_INFO);
-    esp_log_level_set("TCP_STREAM", ESP_LOG_DEBUG);
+    esp_log_level_set("TCP_STREAM", ESP_LOG_VERBOSE);
+    esp_log_level_set("OPUS_ENCODER", ESP_LOG_VERBOSE);
 }
 ///////////////////////////
 
@@ -167,7 +95,6 @@ static void board_event_handler(void *handler_arg, esp_event_base_t base, int32_
     case BOARD_STATE_IDLE:
         if (base == BOARD_EVENT_BASE && event_id == BOARD_EVENT_RECORD) {
             esp_timer_stop(timer_handle);
-            ESP_LOGI(TAG, "[4.7] Set up  uri (file as fatfs_stream, wav as wav encoder)");
             ESP_LOGI(TAG, "[6.0] start audio_pipeline");
             // audio_pipeline_run(pipeline_wav);
             audio_pipeline_run(pipeline_tcp);
@@ -212,8 +139,6 @@ static void timer_board_callback(void *arg) {
 }
 
 void app_main() {
-    int channel_format = I2S_CHANNEL_TYPE_RIGHT_LEFT;
-    int sample_rate = 16000;
     int volume = 0;
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
 
@@ -266,7 +191,6 @@ void app_main() {
 
     audio_hal_set_volume(board_handle->audio_hal, 60);
     audio_hal_get_volume(board_handle->audio_hal, &volume);
-
     ESP_LOGI(TAG, "[3.0] Create audio pipeline_wav for recording");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
     // pipeline_wav = audio_pipeline_init(&pipeline_cfg);
@@ -278,22 +202,23 @@ void app_main() {
     ESP_LOGI(TAG, "[3.1] Create i2s stream to read audio data from codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_READER;
-    i2s_cfg.multi_out_num = 1;
+    //i2s_cfg.multi_out_num = 1;
+    i2s_cfg.out_rb_size = 1024 * 8;
     i2s_cfg.task_core = 1;
-    sample_rate = 16000;
+    i2s_cfg.stack_in_ext = false;
 
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
     i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
-    // i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-    // i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
+    i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;
+    i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = CODEC_SAMPLE_RATE;
 #else
     // i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
     // i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
     // i2s_cfg.i2s_config.sample_rate = sample_rate;
 #endif // (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
 
-    i2s_stream_set_channel_type(&i2s_cfg, channel_format);
+    // i2s_stream_set_channel_type(&i2s_cfg, channel_format);
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
     /*Config http stream writer*/
 
@@ -306,29 +231,29 @@ void app_main() {
     tcp_cfg.ext_stack = false;
     tcp_stream_writer = tcp_stream_init(&tcp_cfg);
     AUDIO_NULL_CHECK(TAG, tcp_stream_writer, return);
-    ////////////////
-    // ESP_LOGI(TAG, "[3.2] Create wav encoder to encode wav format");
-    // wav_encoder_cfg_t wav_cfg = DEFAULT_WAV_ENCODER_CONFIG();
-    // wav_encoder = wav_encoder_init(&wav_cfg);
-
-    // ESP_LOGI(TAG, "[3.3] Create fatfs stream to write data to sdcard");
-    // fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
-    // fatfs_cfg.type = AUDIO_STREAM_WRITER;
-    // wav_fatfs_stream_writer = fatfs_stream_init(&fatfs_cfg);
     // Setup Opus Encoder
-    opus_encoder_cfg_t opus_cfg = DEFAULT_OPUS_ENCODER_CONFIG();
+    raw_opus_enc_config_t opus_cfg = RAW_OPUS_ENC_CONFIG_DEFAULT();
+    opus_cfg.sample_rate = CODEC_SAMPLE_RATE;
+    opus_cfg.channel = CODEC_CHANNEL;
+    opus_cfg.bitrate = CODEC_BIT_RATE;
+    opus_cfg.complexity = OPUS_COMPLEXITY;
     opus_cfg.task_stack = 4096 * 4 * 4;
-    opus_cfg.sample_rate = 16000; // Set sample rate
-    opus_cfg.channel = 2;         // Stereo
-    opus_encoder = encoder_opus_init(&opus_cfg);
+    opus_cfg.stack_in_ext = false;
+    opus_cfg.task_core = 1;
+    opus_cfg.application_mode = RAW_OPUS_ENC_APPLICATION_AUDIO;
+    opus_encoder = raw_opus_encoder_init(&opus_cfg);
     audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
     audio_element_getinfo(i2s_stream_reader, &info);
-    // audio_element_setinfo(wav_fatfs_stream_writer, &info);
 
+    equalizer_cfg_t eq_cfg = DEFAULT_EQUALIZER_CONFIG();
+    eq_cfg.channel = CODEC_CHANNEL;
+    eq_cfg.samplerate = CODEC_SAMPLE_RATE;
+    eq_cfg.stack_in_ext = false;
+    int set_gain[] = { EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_UP, EQUALZIER_UP, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_DOWN, EQUALZIER_UP , EQUALZIER_UP};
+    eq_cfg.set_gain = set_gain; // The size of gain array should be the multiplication of NUMBER_BAND and number channels of audio stream data. The minimum of gain is -13 dB.
+    equalizer = equalizer_init(&eq_cfg);
+    audio_pipeline_register(pipeline_tcp, equalizer, "equalizer");
     ESP_LOGI(TAG, "[3.4] Register all elements to audio pipeline");
-    // audio_pipeline_register(pipeline_wav, i2s_stream_reader, "i2s");
-    // audio_pipeline_register(pipeline_tcp, wav_encoder, "wav");
-    // audio_pipeline_register(pipeline_wav, wav_fatfs_stream_writer, "wav_file");
 
     audio_pipeline_register(pipeline_tcp, i2s_stream_reader, "i2s");
     audio_pipeline_register(pipeline_tcp, opus_encoder, "opus");
@@ -337,20 +262,17 @@ void app_main() {
     ESP_LOGI(TAG, "[3.5] Link it together "
                   "[codec_chip]-->i2s_stream-->wav_encoder-->fatfs_stream-->[sdcard]");
     // const char *link_wav[3] = {"i2s", "wav", "wav_file"};
-    const char *link_tcp[3] = {"i2s", "opus", "tcp"};
+    const char *link_tcp[4] = {"i2s", "equalizer", "opus", "tcp"};
 
-    audio_pipeline_link(pipeline_tcp, &link_tcp[0], 3);
+    audio_pipeline_link(pipeline_tcp, &link_tcp[0], 4);
     // audio_pipeline_link(pipeline_wav, &link_wav[0], 3);
 
-    ESP_LOGI(TAG, "[3.6] Set up  uri (file as fatfs_stream, wav as wav encoder)");
     audio_element_info_t music_info = {0};
     audio_element_getinfo(i2s_stream_reader, &music_info);
-    ESP_LOGI(TAG, "[ * ] Save the recording info to the fatfs stream writer, sample_rates=%d, bits=%d, ch=%d", music_info.sample_rates, music_info.bits, music_info.channels);
-    // opus_encoder_get_music_info
+    ESP_LOGI(TAG, "[ * ] I2S Music info, sample_rates=%d, bits=%d, ch=%d", music_info.sample_rates, music_info.bits, music_info.channels);
+
     // audio_element_setinfo(wav_fatfs_stream_writer, &music_info);
     // audio_element_set_uri(wav_fatfs_stream_writer, "/sdcard/rec_out.wav");
-
-    ESP_LOGI(TAG, "Get board volume :%d", volume);
 
     const esp_timer_create_args_t timer_args = {.callback = &timer_board_callback, .name = "my_timer"};
     esp_timer_create(&timer_args, &timer_handle);
