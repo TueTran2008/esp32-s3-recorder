@@ -285,6 +285,21 @@ void app_main() {
 
     media_lib_add_default_adapter();
 
+    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+
+    periph_wifi_cfg_t wifi_cfg = {
+        .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
+        .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
+    };
+
+    esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
+
+    // Start wifi & button peripheral
+    esp_periph_start(set, wifi_handle);
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL, &instance_got_ip));
+
+    periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
     // esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, "raw://http/audio", 0);
     // Init audio hal to communicate with codec
     esp_mrm_client_config_t config = {
@@ -293,10 +308,25 @@ void app_main() {
         .sync_sock_port = DEFAULT_MRM_SYNC_SOCK_PORT,
         .ctx = NULL,
     };
+
+    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
+    http_cfg.task_stack = 0;
+    http_cfg.out_rb_size = 100 * 1024;
+    http_stream_reader = http_stream_init(&http_cfg);
+
+    raw_stream_cfg_t raw_reader = RAW_STREAM_CFG_DEFAULT();
+    raw_reader.type = AUDIO_STREAM_READER;
+    raw_reader.out_rb_size = 100 * 1024;
+    player_raw_in_h = raw_stream_init(&raw_reader);
+    esp_audio_input_stream_add(player, player_raw_in_h);
+
     mrm_client = esp_mrm_client_create(&config);
 
-    esp_mrm_client_slave_start(mrm_client);
+    // esp_mrm_client_slave_start(mrm_client);
 
     esp_mrm_client_master_start(mrm_client, DEFAULT_PLAY_URL);
     multi_room_play_start(DEFAULT_PLAY_URL);
+    while (1) {
+
+    }
 }
