@@ -59,7 +59,7 @@ extern "C" {
 #define LEDC_FREQUENCY (5000)           // Frequency in Hertz. Set frequency at 4 kHz
 #define PWM_RESOLUTION 8192
 #define BUFFER_SIZE 1024
-typedef enum { BOARD_IDLE = 0, BOARD_START_RECORD = 1, BOARD_STOP_RECORD = 2 } board_state_t;
+typedef enum { BOARD_STATE_IDLE = 0, BOARD_STATE_RECORDING = 1} board_state_t;
 //
 /**
  * @brief Audio board handle

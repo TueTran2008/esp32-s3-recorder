@@ -34,19 +34,19 @@
 #define PA_ENABLE_GPIO -1            /* You need to define the GPIO pins of your board */
 #define ADC_DETECT_GPIO -1           /* You need to define the GPIO pins of your board */
 #define BATTERY_DETECT_GPIO -1       /* You need to define the GPIO pins of your board */
-#define SDCARD_INTR_GPIO GPIO_NUM_13 /* You need to define the GPIO pins of your board */
+#define SDCARD_INTR_GPIO -1 /* You need to define the GPIO pins of your board */
 
 #define SDCARD_OPEN_FILE_NUM_MAX 5
 
 #define BOARD_PA_GAIN (10) /* Power amplifier gain defined by board (dB) */
 
 #define SDCARD_PWR_CTRL -1
-#define ESP_SD_PIN_CLK 12
-#define ESP_SD_PIN_CMD 10
-#define ESP_SD_PIN_D0 9
+#define ESP_SD_PIN_CLK -1
+#define ESP_SD_PIN_CMD -1
+#define ESP_SD_PIN_D0 -1
 #define ESP_SD_PIN_D1 -1
 #define ESP_SD_PIN_D2 -1
-#define ESP_SD_PIN_D3 11
+#define ESP_SD_PIN_D3 -1
 #define ESP_SD_PIN_D4 -1
 #define ESP_SD_PIN_D5 -1
 #define ESP_SD_PIN_D6 -1
@@ -65,7 +65,7 @@
     {                                                                                                                                                                                                  \
         .adc_input = AUDIO_HAL_ADC_INPUT_LINE1,                                                                                                                                                        \
         .dac_output = AUDIO_HAL_DAC_OUTPUT_ALL,                                                                                                                                                        \
-        .codec_mode = AUDIO_HAL_CODEC_MODE_ENCODE,                                                                                                                                                     \
+        .codec_mode = AUDIO_HAL_CODEC_MODE_DECODE,                                                                                                                                                     \
         .i2s_iface =                                                                                                                                                                                   \
             {                                                                                                                                                                                          \
                 .mode = AUDIO_HAL_MODE_SLAVE,                                                                                                                                                          \

@@ -6,3 +6,5 @@ include($ENV{ADF_PATH}/CMakeLists.txt)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(pipeline_wav_amr_sdcard)
+
+# target_add_binary_data(${CMAKE_PROJECT_NAME}.elf "html/index.html" TEXT)
