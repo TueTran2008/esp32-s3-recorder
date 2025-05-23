@@ -1,3 +1,4 @@
+#include "audio_element.h"
 #include "audio_error.h"
 
 #include "audio_hal.h"
@@ -32,6 +33,7 @@
 #include "audio_thread.h"
 #include "media_lib_adapter.h"
 #include "audio_idf_version.h"
+#include "tcp_client_stream.h"
 
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
 #include "esp_netif.h"
@@ -52,31 +54,11 @@
 
 extern audio_hal_func_t AUDIO_CODEC_ES8388_DEFAULT_HANDLE;
 
-static const char *TAG = "HTTP MP3 Streamer";
+static const char *TAG = "TCP Streamer";
 static bool board_init = false;
-static audio_board_handle_t m_board_handler = 0;
 
 static audio_pipeline_handle_t pipeline;
-static audio_element_handle_t player_raw_in_h, i2s_h, http_stream_reader;
-static esp_audio_handle_t player;
-static esp_mrm_client_handle_t mrm_client;
-static bool play_task_run;
-
-static audio_board_handle_t esp_custom_board_handle_init(void) {
-    if (board_init) {
-        ESP_LOGW(TAG, "Custom board audio hal has been initialized!");
-        return m_board_handler;
-    }
-    audio_hal_codec_config_t audio_codec_cfg = AUDIO_CODEC_DEFAULT_CONFIG(); // config from board_def.h
-    m_board_handler = (audio_board_handle_t)audio_calloc(1, sizeof(struct audio_board_handle));
-
-    AUDIO_MEM_CHECK(TAG, m_board_handler, return NULL);
-    m_board_handler->audio_hal = audio_hal_init(&audio_codec_cfg, &AUDIO_CODEC_ES8388_DEFAULT_HANDLE);
-
-    AUDIO_MEM_CHECK(TAG, m_board_handler->audio_hal, return NULL);
-    board_init = true;
-    return m_board_handler;
-}
+static audio_element_handle_t i2s_stream_reader, tcp_stream_writer;
 
 static void log_init(void) {
     esp_log_level_set("*", ESP_LOG_DEBUG);
@@ -86,186 +68,19 @@ static void log_init(void) {
     esp_log_level_set("TCP_STREAM", ESP_LOG_VERBOSE);
     esp_log_level_set("OPUS_ENCODER", ESP_LOG_VERBOSE);
 }
-///////////////////////////
-static void gpio_enable_pa(void) {
-	//zero-initialize the config structure.
-    gpio_config_t io_conf = {};
-    //disable interrupt
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    //set as output mode
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
-    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
-    //disable pull-down mode
-    io_conf.pull_down_en = 0;
-    //disable pull-up mode
-    io_conf.pull_up_en = 0;
-    //configure GPIO with the given settings
-    gpio_config(&io_conf);
-
-    gpio_set_level(GPIO_NUM_4, 1);
-}
 
 static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        // esp_event_post_to(event_loop_handle, BOARD_EVENT_BASE, BOARD_EVENT_RECORD, NULL, 0,
+        //               portMAX_DELAY)
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "ESP board got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGE(TAG, "ESP got ip:" IPSTR, IP2STR(&event->ip_info.ip));
     }
-}
-
-static void setup_player(esp_periph_set_handle_t set)
-{
-    if (player) {
-        return ;
-    }
-    esp_audio_cfg_t cfg = DEFAULT_ESP_AUDIO_CONFIG();
-    audio_board_handle_t board_handle = audio_board_init();
-    cfg.vol_handle = board_handle->audio_hal;
-    cfg.vol_set = (audio_volume_set)audio_hal_set_volume;
-    cfg.vol_get = (audio_volume_get)audio_hal_get_volume;
-    cfg.prefer_type = ESP_AUDIO_PREFER_MEM;
-    cfg.resample_rate = 48000;
-    cfg.evt_que = xQueueCreate(3, sizeof(esp_audio_state_t));
-    player = esp_audio_create(&cfg);
-    audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
-
-    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
-    http_cfg.task_stack = 0;
-    http_cfg.out_rb_size = 100 * 1024;
-    http_stream_reader = http_stream_init(&http_cfg);
-
-    raw_stream_cfg_t raw_reader = RAW_STREAM_CFG_DEFAULT();
-    raw_reader.type = AUDIO_STREAM_READER;
-    raw_reader.out_rb_size = 100 * 1024;
-    player_raw_in_h = raw_stream_init(&raw_reader);
-    esp_audio_input_stream_add(player, player_raw_in_h);
-
-    // Add decoders and encoders to esp_audio
-    audio_decoder_t auto_decode[] = {
-        DEFAULT_ESP_AMRNB_DECODER_CONFIG(),
-        DEFAULT_ESP_AMRWB_DECODER_CONFIG(),
-        DEFAULT_ESP_FLAC_DECODER_CONFIG(),
-        DEFAULT_ESP_OGG_DECODER_CONFIG(),
-        DEFAULT_ESP_OPUS_DECODER_CONFIG(),
-        DEFAULT_ESP_MP3_DECODER_CONFIG(),
-        DEFAULT_ESP_WAV_DECODER_CONFIG(),
-        DEFAULT_ESP_AAC_DECODER_CONFIG(),
-        DEFAULT_ESP_M4A_DECODER_CONFIG(),
-        DEFAULT_ESP_TS_DECODER_CONFIG(),
-    };
-    esp_decoder_cfg_t auto_dec_cfg = DEFAULT_ESP_DECODER_CONFIG();
-    auto_dec_cfg.out_rb_size = 50 * 1024;
-    esp_audio_codec_lib_add(player, AUDIO_CODEC_TYPE_DECODER, esp_decoder_init(&auto_dec_cfg, auto_decode, 10));
-
-    i2s_stream_cfg_t i2s_writer = I2S_STREAM_CFG_DEFAULT();
-    i2s_writer.type = AUDIO_STREAM_WRITER;
-    i2s_h = i2s_stream_init(&i2s_writer);
-    i2s_stream_set_clk(i2s_h, 48000, 16, 2);
-    esp_audio_output_stream_add(player, i2s_h);
-
-    // Set default volume
-    esp_audio_vol_set(player, 40);
-}
-
-static int _player_get_pts()
-{
-    int time;
-    esp_audio_time_get(player, &time);
-    return time;
-}
-
-static void _multi_room_play_task(void *para)
-{
-    char *buf = audio_calloc(1, ESP_READ_BUFFER_SIZE);
-    AUDIO_MEM_CHECK(TAG, buf, vTaskDelete(NULL); return);
-
-    while (play_task_run) {
-        int ret = audio_element_input(http_stream_reader, buf, ESP_READ_BUFFER_SIZE);
-        if (AEL_IO_OK == ret) {
-            audio_element_set_ringbuf_done(player_raw_in_h);
-            audio_element_finish_state(player_raw_in_h);
-            break;
-        }
-        raw_stream_write(player_raw_in_h, buf, ESP_READ_BUFFER_SIZE);
-    }
-
-    audio_element_process_deinit(http_stream_reader);
-    audio_element_stop(http_stream_reader);
-    free(buf);
-
-    esp_mrm_client_master_stop(mrm_client);
-    esp_mrm_client_slave_stop(mrm_client);
-    ESP_LOGI(TAG, "_multi_room_play_task stop");
-    vTaskDelete(NULL);
-}
-
-static esp_err_t multi_room_play_start(const char *url)
-{
-    audio_element_set_uri(http_stream_reader, url);
-    audio_element_process_init(http_stream_reader);
-    audio_element_run(http_stream_reader);
-
-    play_task_run = true;
-    if (audio_thread_create(NULL,
-                            "multi_room_play", _multi_room_play_task,
-                            NULL,
-                            DEFAULT_MRM_TASK_STACK,
-                            DEFAULT_MRM_TASK_PRIO,
-                            true,
-                            0) != ESP_OK) {
-        ESP_LOGE(TAG, "Can not start multi_room_play service");
-        return ESP_FAIL;
-    }
-
-    return ESP_OK;
-}
-
-static int _mrm_event_handler(mrm_event_msg_t *event, void *ctx)
-{
-    int64_t tsf_time = 0;
-    int sync = 0;
-
-    switch ((int)event->type) {
-        case MRM_EVENT_SET_URL:
-            ESP_LOGI(TAG, "slave set url %s", (char *)event->data);
-            multi_room_play_start((char *)event->data);
-            break;
-        case MRM_EVENT_GET_PTS:
-            *(int *)event->data = _player_get_pts();
-            break;
-        case MRM_EVENT_GET_TSF:
-            tsf_time = esp_wifi_get_tsf_time(ESP_IF_WIFI_STA);
-            *(int64_t *)event->data = tsf_time / 1000;
-            break;
-        case MRM_EVENT_SET_SYNC:
-            sync = *(int *)event->data;
-            ESP_LOGD(TAG, "slave got sync %d", sync);
-            break;
-        case MRM_EVENT_SYNC_FAST:
-            sync = *(int *)event->data;
-            if (sync < -200) {
-                sync = -200;
-            }
-            i2s_stream_sync_delay(i2s_h, sync);
-            break;
-        case MRM_EVENT_SYNC_SLOW:
-            sync = *(int *)event->data;
-            if (sync > 200) {
-                sync = 200;
-            }
-            i2s_stream_sync_delay(i2s_h, sync);
-            break;
-        case MRM_EVENT_PLAY_STOP:
-            play_task_run = false;
-            break;
-    }
-
-    return ESP_OK;
 }
 
 void app_main() {
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-
+    int sample_rate = 0;
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
         // NVS partition was truncated and needs to be erased
@@ -281,10 +96,8 @@ void app_main() {
 
     log_init();
 
-    gpio_enable_pa();
 
-    media_lib_add_default_adapter();
-
+    ESP_LOGI(TAG, "[1.0] Wifi Connection");
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
 
     periph_wifi_cfg_t wifi_cfg = {
@@ -300,33 +113,85 @@ void app_main() {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL, &instance_got_ip));
 
     periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
-    // esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, "raw://http/audio", 0);
-    // Init audio hal to communicate with codec
-    esp_mrm_client_config_t config = {
-        .event_handler = _mrm_event_handler,
-        .group_addr = DEFAULT_MRM_GROUP_ADDR,
-        .sync_sock_port = DEFAULT_MRM_SYNC_SOCK_PORT,
-        .ctx = NULL,
-    };
 
-    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
-    http_cfg.task_stack = 0;
-    http_cfg.out_rb_size = 100 * 1024;
-    http_stream_reader = http_stream_init(&http_cfg);
+    ESP_LOGI(TAG, "[2.0] Create audio pipeline for recording");
+    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    pipeline = audio_pipeline_init(&pipeline_cfg);
+    mem_assert(pipeline_wav);
 
-    raw_stream_cfg_t raw_reader = RAW_STREAM_CFG_DEFAULT();
-    raw_reader.type = AUDIO_STREAM_READER;
-    raw_reader.out_rb_size = 100 * 1024;
-    player_raw_in_h = raw_stream_init(&raw_reader);
-    esp_audio_input_stream_add(player, player_raw_in_h);
+    ESP_LOGI(TAG, "[3.0] Create i2s stream to read audio data from codec chip");
+    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
+    i2s_cfg.type = AUDIO_STREAM_READER;
+    i2s_cfg.multi_out_num = 1;
+    i2s_cfg.task_core = 1;
+    sample_rate = 16000;
 
-    mrm_client = esp_mrm_client_create(&config);
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+    i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
+    // i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
+    // i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
+#else
+    //i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
+    //i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    //i2s_cfg.i2s_config.sample_rate = sample_rate;
+#endif // (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
 
-    // esp_mrm_client_slave_start(mrm_client);
+    //i2s_stream_set_channel_type(&i2s_cfg, channel_format);
+    i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
-    esp_mrm_client_master_start(mrm_client, DEFAULT_PLAY_URL);
-    multi_room_play_start(DEFAULT_PLAY_URL);
+    /////////////////
+    ESP_LOGI(TAG, "[3.1] Create tcp client stream to read data");
+    tcp_stream_cfg_t tcp_cfg = TCP_STREAM_CFG_DEFAULT();
+    tcp_cfg.type = AUDIO_STREAM_WRITER;
+    tcp_cfg.port = CONFIG_TCP_PORT;
+    tcp_cfg.host = CONFIG_TCP_URL;
+    tcp_cfg.ext_stack = false;
+    tcp_stream_writer = tcp_stream_init(&tcp_cfg);
+    AUDIO_NULL_CHECK(TAG, tcp_stream_writer, return);
+
+    audio_element_info_t info = AUDIO_ELEMENT_INFO_DEFAULT();
+    audio_element_getinfo(i2s_stream_reader, &info);
+
+    audio_pipeline_register(pipeline, i2s_stream_reader, "i2s");
+    audio_pipeline_register(pipeline, tcp_stream_writer, "tcp");
+
+    ESP_LOGI(TAG, "[3.2] Link it together "
+                  "[codec_chip]-->i2s_stream-->tcp_stream_writer");
+    // const char *link_wav[3] = {"i2s", "wav", "wav_file"};
+    const char *link[2] = {"i2s", "tcp"};
+
+    audio_pipeline_link(pipeline, &link[0], 2);
+
+    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
+    audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
+
+    ESP_LOGI(TAG, "[4.1] Listening event from all elements of pipeline");
+    audio_pipeline_set_listener(pipeline, evt);
+
+    ESP_LOGI(TAG, "[4.2] Listening event from peripherals");
+    audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
     while (1) {
+        audio_event_iface_msg_t msg;
+        esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "[ * ] Event interface error : %d", ret);
+            continue;
+        }
+        ESP_LOGI(TAG, "[ * ] Event received:");
+        ESP_LOGI(TAG, "    Source Type: %d", msg.source_type);
+        ESP_LOGI(TAG, "    Command: %d", msg.cmd);
+        ESP_LOGI(TAG, "    Source Handle: %p", msg.source);
+        ESP_LOGI(TAG, "    Data: %p", msg.data);
+        ESP_LOGI(TAG, "    Data Length: %d", msg.data_len);
+        // Handle specific events
 
+        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *) tcp_stream_writer
+            && msg.cmd == AEL_MSG_CMD_REPORT_STATUS
+            && (((int)msg.data == AEL_STATUS_STATE_STOPPED) || ((int)msg.data == AEL_STATUS_ERROR_OUTPUT) || ((int)msg.data == AEL_STATUS_ERROR_OPEN)  || ((int)msg.data == AEL_STATUS_ERROR_INPUT) || ((int)msg.data == AEL_STATUS_ERROR_PROCESS) || ((int)msg.data == AEL_STATUS_ERROR_TIMEOUT) || ((int)msg.data == AEL_STATUS_ERROR_CLOSE) || ((int)msg.data == AEL_STATUS_ERROR_UNKNOWN)  )) {
+            ESP_LOGE(TAG, "TCP Stop :%d", (int)msg.data);
+
+
+        }
     }
 }
