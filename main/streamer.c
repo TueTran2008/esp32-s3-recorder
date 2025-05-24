@@ -42,10 +42,6 @@
 #include "tcpip_adapter.h"
 #endif
 
-#define CODEC_SAMPLE_RATE 48000
-#define CODEC_CHANNEL 2
-#define CODEC_BIT_RATE 48000 // 32000
-#define OPUS_COMPLEXITY 5    // 5: nghe như MIDI :(, thử để 10 cho tăng chất lượng xem sao! (set >= 8 là treo do CPU 0: el-opus)
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_NUM_4))
 
 extern audio_hal_func_t AUDIO_CODEC_ES8388_DEFAULT_HANDLE;
@@ -210,7 +206,6 @@ static void log_init(void) {
 void app_main() {
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-    int sample_rate = 0;
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
         // NVS partition was truncated and needs to be erased
@@ -235,20 +230,20 @@ void app_main() {
     ESP_LOGI(TAG, "[3.0] Create i2s stream to read audio data from codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_READER;
-    i2s_cfg.multi_out_num = 1;
-    i2s_cfg.task_core = 1;
-    sample_rate = 16000;
+//     i2s_cfg.multi_out_num = 1;
+//     i2s_cfg.task_core = 1;
+//     sample_rate = 16000;
 
-#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
-    i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
-    i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-    i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
-#else
-    //i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
-    //i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-    //i2s_cfg.i2s_config.sample_rate = sample_rate;
-#endif // (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+// #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+//     i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
+    //i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
+    //i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    //i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = 24000;
+// #else
+//     //i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
+//     //i2s_cfg.i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+//     //i2s_cfg.i2s_config.sample_rate = sample_rate;
+// #endif // (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
 
     //i2s_stream_set_channel_type(&i2s_cfg, channel_format);
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
@@ -346,8 +341,8 @@ void app_main() {
 	        && msg.source == (void *)bt_periph) {
 	        if ((msg.cmd == PERIPH_BLUETOOTH_DISCONNECTED) || (msg.cmd == PERIPH_BLUETOOTH_AUDIO_SUSPENDED)) {
 	            ESP_LOGW(TAG, "[ * ] Bluetooth disconnected or suspended");
-	            periph_bt_stop(bt_periph);
-	            break;
+	            //periph_bt_stop(bt_periph);
+	            //break;
 	        }
 	    }
     }
