@@ -90,7 +90,6 @@ static void gpio_config_pa(void) {
 }
 
 void app_main() {
-    int sample_rate = 0;
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
@@ -134,15 +133,15 @@ void app_main() {
     ESP_LOGI(TAG, "[2.2] Create i2s stream to write data to codec chip");
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
     i2s_cfg.type = AUDIO_STREAM_WRITER;
-    i2s_cfg.multi_out_num = 1;
-    i2s_cfg.task_core = 1;
-    sample_rate = 16000;
+    // i2s_cfg.multi_out_num = 1;
+    // i2s_cfg.task_core = 1;
+    // = 16000;
 
 
-    i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
-    i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-    i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
+    //i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
+    // i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
+    // i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = 16000;
 
     i2s_stream_writer = i2s_stream_init(&i2s_cfg);
 
