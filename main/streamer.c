@@ -13,6 +13,7 @@
 #include "esp_wifi.h"
 #include "fatfs_stream.h"
 #include "freertos/idf_additions.h"
+#include "hal/i2s_types.h"
 #include "i2s_stream.h"
 #include "nvs_flash.h"
 #include "periph_wifi.h"
@@ -40,11 +41,6 @@
 #else
 #include "tcpip_adapter.h"
 #endif
-#include "esp_mrm_client.h"
-#include "esp_netif.h"
-
-#define DEFAULT_PLAY_URL "https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.mp3"
-#define ESP_READ_BUFFER_SIZE    4096
 
 #define CODEC_SAMPLE_RATE 48000
 #define CODEC_CHANNEL 2
@@ -128,8 +124,8 @@ void app_main() {
 
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
     i2s_cfg.chan_cfg.id = CODEC_ADC_I2S_PORT;
-    // i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-    // i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    i2s_cfg.std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
+    i2s_cfg.std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = sample_rate;
 #else
     //i2s_cfg.i2s_port = CODEC_ADC_I2S_PORT;
@@ -141,7 +137,7 @@ void app_main() {
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
     /////////////////
-    ESP_LOGI(TAG, "[3.1] Create tcp client stream to read data");
+    ESP_LOGI(TAG, "[3.1] Create tcp client stream to write data");
     tcp_stream_cfg_t tcp_cfg = TCP_STREAM_CFG_DEFAULT();
     tcp_cfg.type = AUDIO_STREAM_WRITER;
     tcp_cfg.port = CONFIG_TCP_PORT;
@@ -163,6 +159,7 @@ void app_main() {
 
     audio_pipeline_link(pipeline, &link[0], 2);
 
+
     audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
     audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
 
@@ -171,6 +168,9 @@ void app_main() {
 
     ESP_LOGI(TAG, "[4.2] Listening event from peripherals");
     audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
+
+    ESP_LOGI(TAG, "[ 5 ] Start audio_pipeline");
+    audio_pipeline_run(pipeline);
     while (1) {
         audio_event_iface_msg_t msg;
         esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
@@ -184,7 +184,6 @@ void app_main() {
         ESP_LOGI(TAG, "    Source Handle: %p", msg.source);
         ESP_LOGI(TAG, "    Data: %p", msg.data);
         ESP_LOGI(TAG, "    Data Length: %d", msg.data_len);
-        // Handle specific events
 
         if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *) tcp_stream_writer
             && msg.cmd == AEL_MSG_CMD_REPORT_STATUS
