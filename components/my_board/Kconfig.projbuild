@@ -12,4 +12,3 @@ config MY_BOARD_V1_0
 endchoice
 
 endmenu
-

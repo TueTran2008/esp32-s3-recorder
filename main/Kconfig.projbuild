@@ -1,29 +1,9 @@
 menu "Example Configuration"
 
-config WIFI_SSID
-    string "WiFi SSID"
-	default "myssid"
+config BT_REMOTE_NAME
+    string "BT remote device name"
+	default "ESP_SINK_STREAM_DEMO"
 	help
-		SSID (network name) for the example to connect to.
-
-config WIFI_PASSWORD
-    string "WiFi Password"
-    default "mypassword"
-	help
-		WiFi password (WPA or WPA2) for the example to use.
-
-		Can be left blank if the network has no security set.
-
-config TCP_URL
-    string "TCP URL"
-    default "192.168.4.1"
-	help
-		TCP Server Address
-
-config TCP_PORT
-    int "TCP PORT"
-    default "8080"
-	help
-		TCP Port Number to connect
+		BT_REMOTE_NAME (Bluetooth device name) for the example to connect to.
 
 endmenu
